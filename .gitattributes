@@ -1,0 +1,26 @@
+# Auto-detect text files
+* text=auto
+
+# Source code — LF line endings
+*.js     text eol=lf
+*.ts     text eol=lf
+*.tsx    text eol=lf
+*.mjs    text eol=lf
+*.json   text eol=lf
+*.css    text eol=lf
+*.html   text eol=lf
+*.svg    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.md     text eol=lf
+
+# Windows batch — CRLF
+*.bat    text eol=crlf
+
+# Binaries — never diff
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.ico    binary
+*.woff   binary
+*.woff2  binary

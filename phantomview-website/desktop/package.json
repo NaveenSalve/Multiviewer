@@ -1,0 +1,13 @@
+{
+  "name": "phantomview-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node main.mjs",
+    "build:exe": "echo EXE build coming soon"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
