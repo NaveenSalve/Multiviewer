@@ -147,6 +147,7 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
     cycles: number;
     startedAt: number | null;
     activeView: boolean;
+    signInWallsSkipped?: number;
     pool?: FarmPoolStatus;
   }
 
@@ -637,23 +638,17 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
       addActivity(`Starting Desktop farm for ${urlType}: ${normalizedUrl}`, 'info');
       const proxyText = proxyListText.trim();
       const proxies = proxyText ? parseProxyList(proxyText) : [];
-      if (proxies.length === 0) {
-        addSecurityLog('Desktop mode needs at least 1 proxy. Auto-fetch or paste proxies.');
-        addActivity('No proxies — Desktop mode aborted', 'error');
-        setLaunching(false);
-        setLaunchProgress(0);
-        return;
-      }
+      const target = proxies.length > 0 ? proxies.length : count;
       try {
         const r = await fetch('http://localhost:3457/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: normalizedUrl, proxies, fastMode, headless, concurrency: farmConfig.concurrency }),
+          body: JSON.stringify({ url: normalizedUrl, proxies, fastMode, headless, concurrency: farmConfig.concurrency, proxyTarget: target }),
         });
         if (r.ok) {
-          addSecurityLog(`[Desktop] Farm started — ${proxies.length} proxies, fastMode=${fastMode}, headless=${headless}`);
-          addActivity(`Farm running — ${proxies.length} proxies, ${tabCount}+ views`, 'success');
-          setLaunchProgress(60);
+          addSecurityLog(`[Desktop] Farm started — target ${target} proxies, fastMode=${fastMode}, headless=${headless}`);
+          addActivity(`Farm running — collecting ${target} proxies`, 'success');
+          setLaunchProgress(10);
         } else {
           const d = await r.json();
           addSecurityLog(`[Desktop] Failed: ${d.error}`);
@@ -675,8 +670,9 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
             const d = await r.json();
             setFarmStatus(d);
             if (d.running) {
-              const pct = Math.min(90, 60 + Math.round((d.viewsSent / tabCount) * 30));
-              setLaunchProgress(pct);
+              const proxyPct = d.proxyCount > 0 ? Math.round((d.proxyCount / (d.pool?.viewsPerBrowser || target)) * 60) : 0;
+              const viewPct = d.viewsSent > 0 ? Math.round((d.viewsSent / Math.max(1, target)) * 10) : 0;
+              setLaunchProgress(Math.min(90, 10 + proxyPct + viewPct));
             }
             if (!d.running) {
               setLaunchProgress(d.viewsSent > 0 ? 100 : 0);
@@ -880,6 +876,14 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                 <span className="flex items-center gap-1 text-neutral-500">
                   <RefreshCw className="w-3.5 h-3.5" />
                   <span className="font-semibold text-neutral-900 dark:text-white">{farmStatus.cycles}</span> cycles
+                </span>
+                <span className="flex items-center gap-1 text-neutral-500">
+                  <Globe className="w-3.5 h-3.5 text-blue-500" />
+                  <span className="font-semibold text-neutral-900 dark:text-white">{farmStatus.proxyCount}</span> proxies
+                </span>
+                <span className="flex items-center gap-1 text-neutral-500">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+                  <span className="font-semibold text-amber-600">{farmStatus.signInWallsSkipped || 0}</span> sign-in
                 </span>
                 <span className="flex items-center gap-1 text-neutral-500">
                   <Monitor className="w-3.5 h-3.5 text-emerald-500" />
@@ -1104,10 +1108,10 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
             </div>
           )}
 
-          {/* Tab Count */}
+          {/* Tab Count / Proxy Target */}
           <div>
             <label className="text-xs font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-1.5 block">
-              Windows (max 999)
+              {desktopMode ? 'Proxy Target' : 'Windows'} (max 999)
             </label>
             <input
               type="number"
@@ -1153,45 +1157,6 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
               <div>
                 <span className="font-semibold">{popupBlockedCount} popup{popupBlockedCount !== 1 ? 's' : ''} blocked.</span>
                 <p className="text-amber-600 dark:text-amber-400 mt-0.5">Please allow popups for this site in your browser settings and try again.</p>
-              </div>
-            </div>
-          )}
-
-          {/* Browser Grid — live screenshots */}
-          {desktopMode && farmStatus?.running && (
-            <div className="border-t border-neutral-200 dark:border-neutral-800 pt-3 mt-1">
-              <h4 className="text-xs font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-2">
-                🖼️ Live Browsers ({farmStatus?.pool?.active ?? 0})
-              </h4>
-              <div className="grid grid-cols-2 gap-1.5 max-h-48 overflow-y-auto">
-                {screenshots.length > 0 && screenshots.slice(0, 8).map((ss, i) => (
-                  <div key={ss.proxy + i} className="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700 bg-neutral-100 dark:bg-neutral-800">
-                    <img
-                      src={`data:image/jpeg;base64,${ss.screenshot}`}
-                      alt={ss.proxy}
-                      className="w-full h-16 object-cover"
-                    />
-                    <div className="px-1.5 py-1">
-                      <div className="text-[9px] text-neutral-500 truncate font-mono">{ss.proxy}</div>
-                      <div className="flex items-center justify-between mt-0.5">
-                        <span className="text-[8px] text-neutral-400">{ss.width}x{ss.height}</span>
-                        <span className="text-[8px] text-neutral-400">{Math.floor(ss.age / 1000)}s</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {/* Mini stat bar */}
-              <div className="flex items-center justify-between mt-2 px-2 py-1.5 rounded-lg bg-neutral-50 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-[10px]">
-                <span className="text-neutral-600 dark:text-neutral-400">
-                  <strong className="text-neutral-900 dark:text-white">{farmStatus.viewsSent}</strong> views
-                </span>
-                <span className="text-neutral-600 dark:text-neutral-400">
-                  <strong className="text-emerald-600">{farmStatus.pool?.active ?? 0}</strong> active
-                </span>
-                <span className="text-neutral-600 dark:text-neutral-400">
-                  <strong className="text-neutral-900 dark:text-white">{farmStatus.cycles}</strong> cycles
-                </span>
               </div>
             </div>
           )}
@@ -1270,11 +1235,9 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                   <label className="text-xs font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider">
                     Proxy List
                   </label>
-                  {proxyBankSize > 0 && (
-                    <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
-                      {proxyBankSize} proxies in bank
-                    </span>
-                  )}
+                  <span className="text-[10px] text-neutral-400">
+                    {desktopMode && !proxyListText.trim() ? 'empty = auto-fetch from bank' : proxyBankSize > 0 ? `${proxyBankSize} in bank` : ''}
+                  </span>
                 </div>
                 <textarea
                   value={proxyListText}
@@ -1410,6 +1373,11 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                       <div className="text-xs text-neutral-500">Cycles</div>
                     </div>
                     <div className="card p-5 text-center">
+                      <Globe className="w-8 h-8 text-blue-500 mx-auto mb-2" />
+                      <div className="text-3xl font-bold text-blue-600">{farmStatus.proxyCount}</div>
+                      <div className="text-xs text-neutral-500">Proxies Collected</div>
+                    </div>
+                    <div className="card p-5 text-center">
                       <Clock className="w-8 h-8 text-violet-500 mx-auto mb-2" />
                       <div className="text-3xl font-bold text-violet-600">
                         {formatDuration(farmStatus?.startedAt ? Date.now() - farmStatus.startedAt : 0)}
@@ -1443,6 +1411,44 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                           <span className="block text-lg font-bold text-neutral-900 dark:text-white">~{estimatedRam}MB</span>
                           <span className="text-neutral-500">RAM</span>
                         </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Live Browser Screenshots */}
+                  {screenshots.length > 0 && (
+                    <div className="card p-4">
+                      <h4 className="text-xs font-semibold text-neutral-500 dark:text-neutral-400 uppercase tracking-wider mb-3">
+                        🖼️ Live Browsers ({farmStatus?.pool?.active ?? 0})
+                      </h4>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {screenshots.map((ss, i) => (
+                          <div key={ss.proxy + i} className="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700 bg-neutral-100 dark:bg-neutral-800">
+                            <img
+                              src={`data:image/jpeg;base64,${ss.screenshot}`}
+                              alt={ss.proxy}
+                              className="w-full h-28 object-cover"
+                            />
+                            <div className="px-2 py-1.5">
+                              <div className="text-[10px] text-neutral-500 truncate font-mono">{ss.proxy}</div>
+                              <div className="flex items-center justify-between mt-0.5">
+                                <span className="text-[9px] text-neutral-400">{ss.width}x{ss.height}</span>
+                                <span className="text-[9px] text-neutral-400">{Math.floor(ss.age / 1000)}s</span>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex items-center justify-between mt-3 px-2 py-1.5 rounded-lg bg-neutral-50 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 text-[10px]">
+                        <span className="text-neutral-600 dark:text-neutral-400">
+                          <strong className="text-neutral-900 dark:text-white">{farmStatus.viewsSent}</strong> views
+                        </span>
+                        <span className="text-neutral-600 dark:text-neutral-400">
+                          <strong className="text-emerald-600">{farmStatus.pool?.active ?? 0}</strong> active
+                        </span>
+                        <span className="text-neutral-600 dark:text-neutral-400">
+                          <strong className="text-neutral-900 dark:text-white">{farmStatus.cycles}</strong> cycles
+                        </span>
                       </div>
                     </div>
                   )}

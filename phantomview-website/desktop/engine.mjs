@@ -54,7 +54,7 @@ export class FarmEngine {
     this.currentIndex = 0;
     this.proxies = [];
     this.url = '';
-    this.stats = { viewsSent: 0, cycles: 0, startedAt: null, activeView: false };
+    this.stats = { viewsSent: 0, cycles: 0, startedAt: null, activeView: false, signInWallsSkipped: 0 };
     this._onEvent = null;
     this._profilePrefix = path.join(os.tmpdir(), 'phantomview-session');
     this.headless = true;
@@ -65,6 +65,7 @@ export class FarmEngine {
     this._browserPool = [];
     this._activeViews = [];
     this._browserLaunchCounter = 0;
+    this.proxyTarget = 10;
     this._proxyPollInterval = null;
     this._bankUrl = 'http://localhost:3456';
   }
@@ -134,25 +135,31 @@ export class FarmEngine {
         }
       }
     } catch (err) {
-      console.log(`[FarmEngine] Proxy bank fetch failed: ${err.message}`);
+      console.log(`[FarmEngine] Proxy bank offline (http://localhost:3456) — ${err.message}. Start proxy server: node server/proxy-server.mjs`);
     }
     return false;
   }
 
-  // Poll proxy bank every 1s — adds to pool as they come
+  // Poll proxy bank every 1s — adds to pool as they come until proxyTarget reached
   async _pollProxyBank() {
     while (this.running) {
+      if (this.proxies.length >= this.proxyTarget) {
+        await delay(2000);
+        continue;
+      }
       try {
         const r = await fetch(`${this._bankUrl}/proxy-bank/next`, { signal: AbortSignal.timeout(2000) });
         const d = await r.json();
         if (d.ok && d.proxy) {
           const parts = d.proxy.split(':');
           const pObj = { host: parts[0], port: parseInt(parts[1]), type: 'http', user: '', pass: '', label: `${parts[0]}:${parseInt(parts[1])}` };
-          if (!this.proxies.find(p => p.host === pObj.host && p.port === pObj.port)) {
+          const exists = this.proxies.find(p => p.host === pObj.host && p.port === pObj.port);
+          if (!exists) {
             this.proxies.push(pObj);
+            console.log(`[FarmEngine] Proxy collected: ${pObj.label} (${this.proxies.length}/${this.proxyTarget})`);
           }
         }
-      } catch (e) { console.error(`[FarmEngine] Proxy poll error: ${e.message}`); }
+      } catch (e) { console.error(`[FarmEngine] Proxy poll error: ${e.message} (bank offline?)`); }
       await delay(1000);
     }
   }
@@ -181,15 +188,30 @@ export class FarmEngine {
     this.running = true;
     this.paused = false;
     this.url = targetUrl;
-    this.stats.startedAt = Date.now();
     this.currentIndex = 0;
+    this.stats = { viewsSent: 0, cycles: 0, startedAt: Date.now(), activeView: false, signInWallsSkipped: 0 };
 
     this._emit('start', { browser: browserInfo.type });
 
-    // A1: User provided proxies (via setProxies) — use them directly
+    // User provided proxies — use as-is, no bank polling
     if (this.proxies.length > 0) {
+      this.proxyTarget = this.proxies.length;
       console.log(`[FarmEngine] Using ${this.proxies.length} user-provided proxies`);
     } else {
+      // Bank mode — continuously fetch until proxyTarget reached
+      // First check if proxy server is alive
+      try {
+        const health = await fetch(`${this._bankUrl}/health`, { signal: AbortSignal.timeout(2000) });
+        if (!health.ok) throw new Error(`Status ${health.status}`);
+        console.log('[FarmEngine] Proxy bank online at', this._bankUrl);
+      } catch (e) {
+        console.error(`[FarmEngine] Proxy server OFFLINE at ${this._bankUrl} — ${e.message}`);
+        console.error('[FarmEngine] Start it: node server/proxy-server.mjs in a separate terminal');
+        throw new Error(`Proxy server not running at ${this._bankUrl}. Run: node server/proxy-server.mjs`);
+      }
+
+      this._proxyPollInterval = setInterval(() => this._pollProxyBank(), 1000);
+
       // 1. Try to fetch existing proxies from bank first
       console.log('[FarmEngine] Checking proxy bank for existing proxies...');
       let hasProxies = await this.fetchFromProxyBank();
@@ -203,15 +225,12 @@ export class FarmEngine {
           console.log(`[FarmEngine] Harvest complete: ${data.alive || 0} live proxies found`);
           hasProxies = await this.fetchFromProxyBank();
         } catch (e) {
-          console.error(`[FarmEngine] Harvest failed: ${e.message}`);
+          console.error(`[FarmEngine] Harvest failed: ${e.message}. Check proxy server at http://localhost:3456`);
         }
       } else {
         console.log(`[FarmEngine] Using ${this.proxies.length} existing proxies from bank`);
       }
     }
-
-    // 3. Start polling bank every 1s for new proxies
-    this._proxyPollInterval = setInterval(() => this._pollProxyBank(), 1000);
 
     this._activeViews = [];
 
@@ -286,6 +305,7 @@ export class FarmEngine {
   }
 
   async _createBrowser(proxy, execPath) {
+    if (!proxy) throw new Error('Cannot launch browser without a proxy — IP leak risk');
     const profileDir = `${this._profilePrefix}-${Date.now()}-${this._browserLaunchCounter++}`;
     // Clean up any leftover profile dir from previous run
     try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (e) { console.error(`[FarmEngine] Cleanup profile error: ${e.message}`); }
@@ -298,6 +318,7 @@ export class FarmEngine {
       '--enforce-webrtc-permission-check',
       '--disable-background-networking',
       '--proxy-bypass-list=<-loopback>',
+      '--host-resolver-rules="MAP * ~NOTAVAILABLE , EXCLUDE localhost"',
       '--disable-features=UseDnsHttpsSvcb,WebRtcRemoteEventLog',
       '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows',
@@ -344,43 +365,7 @@ export class FarmEngine {
     });
 
     const page = await browser.newPage();
-
-    if (proxy?.user) {
-      await page.authenticate({ username: proxy.user, password: proxy.pass });
-    }
-
-    const vp = VIEWPORT_SIZES[Math.floor(Math.random() * VIEWPORT_SIZES.length)];
-    await page.setViewport(vp);
-
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin' }
-        ]
-      });
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => [2, 4, 8][Math.floor(Math.random() * 3)] });
-      Object.defineProperty(navigator, 'deviceMemory', { get: () => [4, 8][Math.floor(Math.random() * 2)] });
-      const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-      CanvasRenderingContext2D.prototype.getImageData = function (...args) {
-        const imageData = originalGetImageData.apply(this, args);
-        const noise = () => Math.floor(Math.random() * 4 - 2);
-        for (let i = 3; i < imageData.data.length; i += 4) {
-          imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + noise()));
-        }
-        return imageData;
-      };
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (param) {
-        if (param === 37445) return 'Intel Inc.';
-        if (param === 37446) return 'Intel Iris OpenGL Engine';
-        return getParameter.call(this, param);
-      };
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-    });
+    await this._setupPageDefaults(page, proxy);
 
     return { browser, page, viewsDone: 0, profileDir, busy: false, proxy, screenshot: null, screenshotAt: 0 };
   }
@@ -413,6 +398,50 @@ export class FarmEngine {
     this._browserPool = [];
   }
 
+  async _setupFingerprint(page) {
+    return page.evaluateOnNewDocument(() => {
+      try { delete window.RTCPeerConnection; } catch(e) {}
+      try { delete window.webkitRTCPeerConnection; } catch(e) {}
+      try { delete window.RTCDataChannel; } catch(e) {}
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin' }
+        ]
+      });
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => [2, 4, 8][Math.floor(Math.random() * 3)] });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => [4, 8][Math.floor(Math.random() * 2)] });
+      const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function (...args) {
+        const imageData = originalGetImageData.apply(this, args);
+        const noise = () => Math.floor(Math.random() * 4 - 2);
+        for (let i = 3; i < imageData.data.length; i += 4) {
+          imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + noise()));
+        }
+        return imageData;
+      };
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function (param) {
+        if (param === 37445) return 'Intel Inc.';
+        if (param === 37446) return 'Intel Iris OpenGL Engine';
+        return getParameter.call(this, param);
+      };
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    });
+  }
+
+  async _setupPageDefaults(page, proxy) {
+    const vp = VIEWPORT_SIZES[Math.floor(Math.random() * VIEWPORT_SIZES.length)];
+    await page.setViewport(vp);
+    if (proxy?.user) {
+      await page.authenticate({ username: proxy.user, password: proxy.pass });
+    }
+    await this._setupFingerprint(page);
+  }
+
   async _closeOverlays(page) {
     try {
       await page.evaluate(() => {
@@ -437,6 +466,19 @@ export class FarmEngine {
           '.btn-close',
           '.dismiss-button',
           'button:has(svg)',
+          // Sign-in wall close buttons
+          'button[aria-label*="Sign"]',
+          'button[aria-label*="sign"]',
+          'button[aria-label*="Close sign"]',
+          'button[aria-label*="Dismiss sign"]',
+          '[class*="auth"] button[aria-label*="Close"]',
+          '[class*="auth"] button[aria-label*="Dismiss"]',
+          '[class*="auth"] [aria-label*="×"]',
+          '[class*="sign-in"] button, [class*="signin"] button',
+          '[class*="login"] button[aria-label*="Close"]',
+          '[class*="login"] button[aria-label*="Dismiss"]',
+          '[aria-label*="Close sign-in"]',
+          '[aria-label*="Dismiss sign-in"]',
           // LinkedIn-specific
           'button[data-tracking-control-name*="guest-modal"]',
           '.sign-in-modal button[aria-label="Dismiss"]',
@@ -455,6 +497,88 @@ export class FarmEngine {
         }
       });
     } catch (e) { console.error(`[FarmEngine] Close overlays evaluate error: ${e.message}`); }
+  }
+
+  async _detectSignInWall(page) {
+    try {
+      const currentUrl = page.url() || '';
+      const urlLower = decodeURIComponent(currentUrl).toLowerCase();
+      const urlPatterns = ['/login', '/signin', '/auth', '/register', '/signup', '/log-in', '/logon', '/authenticate'];
+      if (urlPatterns.some(p => urlLower.includes(p))) return true;
+
+      return await page.evaluate(() => {
+        const title = (document.title || '').toLowerCase();
+        if (['sign in', 'log in', 'login', 'signin', 'create account', 'sign up', 'register'].some(k => title.includes(k))) return true;
+
+        const bodyText = (document.body?.textContent || '').toLowerCase();
+        const keywords = ['sign in', 'log in', 'create account', 'sign up', 'welcome back', 'register', 'continue with', 'forgot password'];
+        const matchCount = keywords.filter(k => bodyText.includes(k)).length;
+
+        const pwFields = document.querySelectorAll('input[type="password"]');
+        const emailFields = document.querySelectorAll('input[type="email"], input[name="email"], input[name="username"], input[name="login"]');
+        const hasFormField = pwFields.length > 0 || emailFields.length > 0;
+
+        // Strong signal: form field + sign-in keyword
+        if (hasFormField && matchCount >= 1) return true;
+
+        // Check visible auth containers (class, id, form action)
+        const authSelectors = [
+          '[class*="auth-wall"]', '[class*="auth-container"]',
+          '[class*="signin"]', '[class*="sign-in"]',
+          '[class*="signup"]', '[class*="sign-up"]', '[class*="register"]',
+          '[class*="login"]', '[class*="log-in"]', '[class*="logon"]',
+          '[id*="login"]', '[id*="signin"]', '[id*="sign-in"]',
+          '.auth-form', '#signin-form', '#signup-form', '#login-form',
+          'form[action*="login"]', 'form[action*="signin"]', 'form[action*="auth"]',
+          'form[action*="register"]', 'form[action*="signup"]',
+          '[data-testid*="login"]', '[data-testid*="Login"]',
+          '[data-testid*="signin"]', '[data-testid*="Signin"]',
+          '[data-testid*="auth"]', '[data-testid*="Auth"]',
+          '[data-testid*="signup"]', '[data-testid*="Signup"]',
+        ];
+        for (const sel of authSelectors) {
+          try {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) return true;
+          } catch(e) {}
+        }
+
+        // Check role="dialog" / modal with sign-in text
+        const dialogs = document.querySelectorAll('div[role="dialog"], [role="presentation"], .modal, [class*="modal"], [class*="overlay"]');
+        for (const el of dialogs) {
+          try {
+            if (el.offsetParent === null) continue;
+            const text = (el.textContent || '').toLowerCase();
+            if (keywords.some(k => text.includes(k)) && hasFormField) return true;
+          } catch(e) {}
+        }
+
+        // Check prominent headings/buttons for sign-in text
+        const headings = document.querySelectorAll('h1, h2, h3, button[type="submit"], [class*="heading"], [class*="title"]');
+        for (const el of headings) {
+          const text = (el.textContent || '').toLowerCase().trim();
+          if (['sign in', 'log in', 'sign up', 'sign up now', 'create account', 'register', 'get started', 'continue with'].includes(text)) return true;
+        }
+
+        // Check for full-page overlay with form (position fixed + high z-index)
+        const allDivs = document.querySelectorAll('div');
+        const maxCheck = Math.min(allDivs.length, 200);
+        for (let i = 0; i < maxCheck; i++) {
+          try {
+            const el = allDivs[i];
+            const cs = window.getComputedStyle(el);
+            if (cs.position === 'fixed' && parseInt(cs.zIndex) > 100 && el.offsetParent !== null) {
+              const text = (el.textContent || '').toLowerCase();
+              if (keywords.some(k => text.includes(k)) && el.querySelector('input')) return true;
+            }
+          } catch(e) {}
+        }
+
+        return false;
+      });
+    } catch(e) {
+      return false;
+    }
   }
 
   async _launchView(url, proxy, execPath) {
@@ -477,11 +601,34 @@ export class FarmEngine {
       await delay(randomBetween(500, 1500));
       await this._closeOverlays(poolEntry.page);
 
+      // Wait for JS to render (sign-in walls are often client-side rendered)
+      await delay(3000);
+
       // Capture screenshot for UI preview
       try {
         poolEntry.screenshot = await poolEntry.page.screenshot({ type: 'jpeg', quality: 30, encoding: 'base64' });
         poolEntry.screenshotAt = Date.now();
       } catch (e) { console.error(`[FarmEngine] Screenshot error: ${e.message}`); poolEntry.screenshot = null; }
+
+      // Sign-in wall detection — try to dismiss first, else close page & reuse same IP
+      const hasSignIn = await this._detectSignInWall(poolEntry.page);
+      if (hasSignIn) {
+        console.log(`[FarmEngine] Sign-in wall detected for ${poolEntry.proxyLabel}, attempting dismiss...`);
+        await this._closeOverlays(poolEntry.page);
+        await delay(2000);
+
+        if (await this._detectSignInWall(poolEntry.page)) {
+          console.log(`[FarmEngine] Sign-in wall persists for ${poolEntry.proxyLabel}, closing page and reusing same IP...`);
+          this.stats.signInWallsSkipped++;
+          try { await poolEntry.page.close(); } catch(e) {}
+          const newPage = await poolEntry.browser.newPage();
+          await this._setupPageDefaults(newPage, proxy);
+          poolEntry.page = newPage;
+          poolEntry.viewsDone++;
+          this.stats.activeView = false;
+          return;
+        }
+      }
 
       const watchTime = getViewDuration(this.fastMode, url);
       const startTime = Date.now();

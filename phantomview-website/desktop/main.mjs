@@ -71,11 +71,11 @@ const server = http.createServer((req, res) => {
       try {
         const data = JSON.parse(body);
         if (!data.url) throw new Error('Missing url');
-        if (!data.proxies || data.proxies.length === 0) throw new Error('No proxies');
         if (typeof data.fastMode === 'boolean') engine.fastMode = data.fastMode;
         if (typeof data.headless === 'boolean') engine.headless = data.headless;
         if (typeof data.concurrency === 'number') engine.concurrency = Math.max(1, Math.min(data.concurrency, 15));
-        engine.setProxies(data.proxies);
+        if (typeof data.proxyTarget === 'number') engine.proxyTarget = Math.max(1, Math.min(data.proxyTarget, 999));
+        engine.setProxies(data.proxies || []);
         engine.start(data.url).catch(err => {
           console.error('[Farm] Error:', err.message);
           engine.running = false;
