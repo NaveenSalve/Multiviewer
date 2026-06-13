@@ -1,6 +1,24 @@
-import React, { useRef } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import React, { useRef, useEffect } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+
+function useIsVisible() {
+  const { gl } = useThree();
+  const [visible, setVisible] = React.useState(true);
+
+  React.useEffect(() => {
+    const el = gl.domElement;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: 0 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [gl.domElement]);
+
+  return visible;
+}
 
 interface MonitorProps {
   position: [number, number, number];
@@ -9,10 +27,13 @@ interface MonitorProps {
 }
 
 function MonitorMesh({ position, color, delay }: MonitorProps) {
-  const meshRef = useRef<THREE.Mesh>(null!);
+  const meshRef = useRef<THREE.Group>(null!);
   const screenRef = useRef<THREE.Mesh>(null!);
 
+  const visible = useIsVisible();
+
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = clock.getElapsedTime() + delay;
     if (meshRef.current) {
       // Gentle floating animation
@@ -25,6 +46,23 @@ function MonitorMesh({ position, color, delay }: MonitorProps) {
       (screenRef.current.material as THREE.MeshStandardMaterial).emissiveIntensity = intensity;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (meshRef.current) {
+        meshRef.current.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry?.dispose();
+            if (Array.isArray(child.material)) {
+              child.material.forEach(m => m.dispose());
+            } else {
+              child.material?.dispose();
+            }
+          }
+        });
+      }
+    };
+  }, []);
 
   return (
     <group ref={meshRef} position={position}>

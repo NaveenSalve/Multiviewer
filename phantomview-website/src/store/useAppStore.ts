@@ -95,6 +95,14 @@ const DEFAULT_SESSIONS: OsSession[] = [
 
 const now = () => new Date().toLocaleTimeString();
 
+// Progressive quality management: auto-downgrades as session count grows
+function getAutoQuality(sessionCount: number, resourceAiActive: boolean, baseQuality?: '1080p' | '720p' | '480p'): '1080p' | '720p' | '480p' {
+  if (!resourceAiActive) return baseQuality || '1080p';
+  if (sessionCount <= 6) return '1080p';
+  if (sessionCount <= 20) return '720p';
+  return '480p';
+}
+
 export const useAppStore = create<AppState>((set) => ({
   activePreset: 'creator',
   setActivePreset: (activePreset) => set({ activePreset }),
@@ -102,17 +110,20 @@ export const useAppStore = create<AppState>((set) => ({
   setOverlayMode: (overlayMode) => set({ overlayMode }),
   resourceAiActive: true,
   setResourceAiActive: (resourceAiActive) => {
-    set({ resourceAiActive });
-    set((state) => ({
-      securityLogs: [
-        `[${now()}] Neural Resource AI ${resourceAiActive ? 'ENGAGED' : 'DISABLED'}`,
-        ...state.securityLogs,
-      ],
-      osSessions: state.osSessions.map(s => ({
-        ...s,
-        quality: resourceAiActive ? '720p' : '1080p'
-      }))
-    }));
+    set((state) => {
+      const autoQuality = getAutoQuality(state.osSessions.length, resourceAiActive);
+      return {
+        resourceAiActive,
+        securityLogs: [
+          `[${now()}] Neural Resource AI ${resourceAiActive ? 'ENGAGED' : 'DISABLED'} — quality: ${autoQuality}`,
+          ...state.securityLogs,
+        ],
+        osSessions: state.osSessions.map(s => ({
+          ...s,
+          quality: resourceAiActive ? autoQuality as '1080p' | '720p' | '480p' : (s.quality || '1080p') as '1080p' | '720p' | '480p',
+        }))
+      };
+    });
   },
   videoMatrixMode: '9',
   setVideoMatrixMode: (videoMatrixMode) => set({ videoMatrixMode }),
@@ -140,6 +151,7 @@ export const useAppStore = create<AppState>((set) => ({
 
     if (count > currentSessions.length) {
       const diff = count - currentSessions.length;
+      const autoQuality = getAutoQuality(count, state.resourceAiActive);
       const added = Array.from({ length: diff }).map((_, i) => {
         const index = currentSessions.length + i;
         return {
@@ -149,7 +161,7 @@ export const useAppStore = create<AppState>((set) => ({
           url: 'https://www.google.com',
           proxy: state.proxyList[index % (state.proxyList.length || 1)] || 'Direct',
           muted: true,
-          quality: '480p' as const,
+          quality: autoQuality,
           partition: `persist:tab-${index}-${Date.now()}`,
           corsProxyUrl: getCorsProxy(),
         };
@@ -159,23 +171,38 @@ export const useAppStore = create<AppState>((set) => ({
       newSessions = newSessions.slice(0, count);
     }
 
+    // Auto-tune quality for all sessions based on new count
+    const autoQuality = getAutoQuality(newSessions.length, state.resourceAiActive);
+    newSessions = newSessions.map(s => ({
+      ...s,
+      quality: state.resourceAiActive ? autoQuality as '1080p' | '720p' | '480p' : s.quality,
+    }));
+
     return {
       gridCount: count,
       osSessions: newSessions,
       osLayout: 'dynamic',
-      securityLogs: [`[${now()}] Matrix Reconfigured: ${count} slots`, ...state.securityLogs]
+      securityLogs: [`[${now()}] Matrix Reconfigured: ${count} slots (quality: ${autoQuality})`, ...state.securityLogs]
     };
   }),
   setOsLayout: (osLayout) => set({ osLayout }),
-  addOsSession: (newSession) => set((state) => ({
-    osSessions: [...state.osSessions, {
-      ...newSession,
-      id: `s-${Date.now()}`,
-      partition: `persist:tab-${Date.now()}`,
-      corsProxyUrl: getCorsProxy(),
-    }],
-    securityLogs: [`[${now()}] Session Deployed: ${newSession.title} (${newSession.proxy})`, ...state.securityLogs]
-  })),
+  addOsSession: (newSession) => set((state) => {
+    const newCount = state.osSessions.length + 1;
+    const autoQuality = getAutoQuality(newCount, state.resourceAiActive);
+    return {
+      osSessions: [...state.osSessions.map(s => ({
+        ...s,
+        quality: state.resourceAiActive ? autoQuality as '1080p' | '720p' | '480p' : s.quality,
+      })), {
+        ...newSession,
+        id: `s-${Date.now()}`,
+        quality: newSession.quality || autoQuality,
+        partition: `persist:tab-${Date.now()}`,
+        corsProxyUrl: getCorsProxy(),
+      }],
+      securityLogs: [`[${now()}] Session Deployed: ${newSession.title} (${newSession.proxy}) — quality: ${autoQuality}`, ...state.securityLogs]
+    };
+  }),
   launchMultiVideo: (url, count = 4) => set((state) => {
     let type: SessionType = 'browser';
     let videoId = url;
@@ -193,6 +220,7 @@ export const useAppStore = create<AppState>((set) => ({
     if (type === 'browser') {
       if (/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i.test(url)) type = 'video';
     }
+    const autoQuality = getAutoQuality(count, state.resourceAiActive);
     const newSessions: OsSession[] = Array.from({ length: count }).map((_, i) => ({
       id: `v-${Date.now()}-${i}`,
       title: `Multi-Sync #${i + 1}`,
@@ -200,7 +228,7 @@ export const useAppStore = create<AppState>((set) => ({
       url: videoId,
       proxy: 'Direct (Sync Optimized)',
       muted: i !== 0,
-      quality: '720p',
+      quality: autoQuality,
       partition: `persist:tab-sync-${i}-${Date.now()}`,
       corsProxyUrl: getCorsProxy(),
     }));
@@ -208,7 +236,7 @@ export const useAppStore = create<AppState>((set) => ({
       gridCount: count,
       osSessions: newSessions,
       osLayout: 'dynamic',
-      securityLogs: [`[${now()}] Multi-Sync Deployed: ${count}x to ${url}`, ...state.securityLogs]
+      securityLogs: [`[${now()}] Multi-Sync Deployed: ${count}x to ${url} (quality: ${autoQuality})`, ...state.securityLogs]
     };
   }),
   removeOsSession: (id) => set((state) => ({
@@ -288,11 +316,18 @@ export const useAppStore = create<AppState>((set) => ({
         { id: 'st-4', title: 'Tech News', type: 'news', url: '', proxy: 'Direct', muted: true, quality: '1080p' },
       ];
     }
-    set((state) => ({
-      activePreset: preset,
-      osSessions: sessions.map(s => ({ ...s, corsProxyUrl: getCorsProxy() })),
-      securityLogs: [`[${now()}] Preset Loaded: ${preset.toUpperCase()}`, ...state.securityLogs],
-    }));
+    set((state) => {
+      const autoQuality = getAutoQuality(sessions.length, state.resourceAiActive);
+      return {
+        activePreset: preset,
+        osSessions: sessions.map(s => ({
+          ...s,
+          quality: state.resourceAiActive ? autoQuality as '1080p' | '720p' | '480p' : s.quality,
+          corsProxyUrl: getCorsProxy(),
+        })),
+        securityLogs: [`[${now()}] Preset Loaded: ${preset.toUpperCase()} (quality: ${autoQuality})`, ...state.securityLogs],
+      };
+    });
   },
 
   // ── Mission Control v2.4 ──
@@ -317,7 +352,7 @@ export const useAppStore = create<AppState>((set) => ({
         id: `m-${Date.now()}-${i}`,
         title: `Tab #${i + 1}`,
         type: 'browser',
-        url: url.startsWith('http') ? url : `https://${url}`,
+        url: /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url) ? url : `https://${url}`,
         proxy,
         muted: true,
         quality: quality,

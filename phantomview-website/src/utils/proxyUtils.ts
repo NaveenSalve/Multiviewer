@@ -130,15 +130,13 @@ export async function checkProxyHealth(proxyUrls: string[]): Promise<HealthResul
 
 export function buildProxyUrl(targetUrl: string, userProxy: ParsedProxy | null): string {
   if (userProxy) {
-    // Route through local proxy server for SOCKS5/HTTP proxy support
     const proxyServer = 'http://localhost:3456/proxy';
     const proxyStr = `${userProxy.host}:${userProxy.port}:${userProxy.user}:${userProxy.pass}`;
     return `${proxyServer}?url=${encodeURIComponent(targetUrl)}&proxy=${encodeURIComponent(proxyStr)}`;
   }
 
-  // No user proxy — use public CORS proxy with rotation
-  const cp = getRandomCorsProxy();
-  return `${cp.url}${encodeURIComponent(targetUrl)}`;
+  // No user proxy — load directly (reliable). Public CORS proxies are unreliable.
+  return targetUrl;
 }
 
 // ── Generate sandboxed srcdoc with UA override + blocked APIs ──

@@ -1,9 +1,12 @@
-﻿import { Clock, Grid, Plus } from 'lucide-react';
+﻿import { Clock, Grid, Plus, AlertTriangle } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
+
+const MAX_GRID = 25;
+const RAM_PER_SESSION = 100; // MB average per session
 
 export function OsHeader() {
-  const { gridCount, setGridCount, addSecurityLog } = useAppStore();
+  const { gridCount, setGridCount, addSecurityLog, osSessions } = useAppStore();
   const [time, setTime] = useState('');
 
   useEffect(() => {
@@ -15,6 +18,10 @@ export function OsHeader() {
     const id = setInterval(update, 1000);
     return () => clearInterval(id);
   }, []);
+
+  const estimatedRam = useMemo(() => osSessions.length * RAM_PER_SESSION, [osSessions.length]);
+  const ramWarning = estimatedRam > 2000; // yellow > 2GB
+  const ramCritical = estimatedRam > 4000; // red > 4GB
 
   return (
     <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950">
@@ -28,15 +35,23 @@ export function OsHeader() {
           <input
             type="number"
             min={1}
-            max={100}
+            max={MAX_GRID}
             value={gridCount}
             onChange={e => {
-              const v = Math.min(100, Math.max(1, Number(e.target.value)));
+              const v = Math.min(MAX_GRID, Math.max(1, Number(e.target.value)));
               setGridCount(v);
               addSecurityLog(`Grid count set to ${v}`);
             }}
             className="w-16 px-2 py-1 text-xs rounded-lg border border-neutral-200 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-900 text-neutral-900 dark:text-white text-center"
           />
+        </div>
+        <div className={`flex items-center gap-1.5 text-[11px] ${
+          ramCritical ? 'text-red-600 dark:text-red-400' :
+          ramWarning ? 'text-amber-600 dark:text-amber-400' :
+          'text-neutral-400'
+        }`}>
+          {ramWarning && <AlertTriangle className="w-3 h-3" />}
+          <span>~{estimatedRam} MB</span>
         </div>
       </div>
 

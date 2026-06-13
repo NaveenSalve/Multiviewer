@@ -1,4 +1,4 @@
-﻿import { useRef, useState, useCallback } from 'react';
+﻿import { memo, useRef, useState, useCallback, useMemo, useEffect } from 'react';
 import {
   Monitor, Terminal, ChartLine, Globe, Video,
   Shield, ShieldOff, X, AlertTriangle,
@@ -22,16 +22,17 @@ interface OsPaneProps {
   bare?: boolean;
 }
 
-export function OsPane({ id, title, type, url: propUrl, muted: propMuted, proxy: propProxy, onRemove, bare }: OsPaneProps) {
+function OsPaneInner({ id, title, type, url: propUrl, muted: propMuted, proxy: propProxy, onRemove, bare }: OsPaneProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [loadError, setLoadError] = useState(false);
 
-  const store = useAppStore();
-  const session = store.osSessions.find(s => s.id === id);
+  // Selective selectors — avoids re-render on unrelated store changes
+  const session = useAppStore(s => s.osSessions.find(s => s.id === id));
+  const corsEnabled = useAppStore(s => s.corsProxyEnabled);
   const url = propUrl ?? session?.url ?? '';
   const proxy = propProxy ?? session?.proxy ?? 'Direct';
   const muted = propMuted ?? session?.muted ?? true;
-  const corsEnabled = store.corsProxyEnabled;
+  const quality = session?.quality ?? '1080p';
 
   const isDirect = proxy === 'Direct' || proxy.includes('Direct');
   const isProxied = !isDirect;
@@ -65,28 +66,41 @@ export function OsPane({ id, title, type, url: propUrl, muted: propMuted, proxy:
     setLoadError(true);
   }, []);
 
+  // Cleanup iframe on unmount to free memory
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    return () => {
+      if (iframe) {
+        iframe.src = '';
+        iframe.srcdoc = '';
+      }
+    };
+  }, []);
+
+  const qualityParam = quality === '480p' ? '&quality=small' : quality === '720p' ? '&quality=medium' : '&quality=hd1080';
+
   const iframeSrc = useCallback(() => {
     if (!url) return undefined;
     if (type === 'tradingview') return undefined;
     if (type === 'youtube' || type === 'lofi') {
-      return `https://www.youtube-nocookie.com/embed/${url}?autoplay=1&mute=1&controls=0&modestbranding=1&rel=0`;
+      return `https://www.youtube-nocookie.com/embed/${url}?autoplay=1&mute=1&controls=0&modestbranding=1&rel=0${qualityParam}`;
     }
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      if (corsEnabled && isProxied) {
-        const parsedUserProxy = proxy ? parseProxy(proxy) : null;
+      if (corsEnabled) {
+        const parsedUserProxy = proxy && !isDirect ? parseProxy(proxy) : null;
         return buildProxyUrl(url, parsedUserProxy);
       }
       return url;
     }
     return undefined;
-  }, [url, type, corsEnabled, isProxied, proxy]);
+  }, [url, type, corsEnabled, isProxied, proxy, qualityParam]);
 
-  const src = iframeSrc();
-  const srcDoc = (!isProxied && url)
+  const src = useMemo(() => iframeSrc(), [iframeSrc]);
+  const srcDoc = useMemo(() => (!isProxied && url)
     ? getIsolatedIframeSrcdoc(url)
-    : undefined;
+    : undefined, [isProxied, url]);
 
-  const iframeProps = {
+  const iframeProps = useMemo(() => ({
     ref: iframeRef,
     className: 'absolute inset-0 w-full h-full',
     sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups',
@@ -96,7 +110,7 @@ export function OsPane({ id, title, type, url: propUrl, muted: propMuted, proxy:
     onError: handleError,
     allow: 'autoplay; encrypted-media',
     title: title,
-  };
+  }), [handleLoad, handleError, title]);
 
   if (bare) {
     return (
@@ -198,3 +212,5 @@ export function OsPane({ id, title, type, url: propUrl, muted: propMuted, proxy:
     </div>
   );
 }
+
+export const OsPane = memo(OsPaneInner);

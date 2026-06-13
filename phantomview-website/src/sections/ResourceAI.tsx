@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect } from 'react';
 import { Cpu, Battery, Zap, Thermometer, Gauge } from 'lucide-react';
+import { useAppStore } from '../store/useAppStore';
 
 const STATS = [
   { label: 'Memory Saved', value: '4.8 GB', icon: Battery, color: 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/30' },
@@ -32,7 +33,7 @@ function RamCounter({ target, active }: { target: number; active: boolean }) {
 }
 
 export function ResourceAI() {
-  const [active, setActive] = useState(true);
+  const { resourceAiActive, setResourceAiActive } = useAppStore();
 
   return (
     <section id="resource-ai" className="section-padding bg-neutral-50 dark:bg-neutral-900">
@@ -55,23 +56,23 @@ export function ResourceAI() {
               <div>
                 <p className="text-sm text-neutral-500 dark:text-neutral-400 mb-1">RAM Usage</p>
                 <div className="flex items-baseline gap-1.5">
-                  <RamCounter target={4.8} active={active} />
+                  <RamCounter target={4.8} active={resourceAiActive} />
                   <span className="text-lg text-neutral-400 dark:text-neutral-500">GB</span>
                 </div>
                 <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-1">
-                  {active ? 'AI optimization active — saving 3.4 GB' : 'AI optimization disabled'}
+                  {resourceAiActive ? 'AI optimization active — saving 3.4 GB' : 'AI optimization disabled'}
                 </p>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-sm text-neutral-600 dark:text-neutral-400">AI Control</span>
                 <button
-                  onClick={() => setActive(!active)}
+                  onClick={() => setResourceAiActive(!resourceAiActive)}
                   className={`relative w-12 h-6 rounded-full transition-colors cursor-pointer ${
-                    active ? 'bg-primary-600' : 'bg-neutral-300 dark:bg-neutral-700'
+                    resourceAiActive ? 'bg-primary-600' : 'bg-neutral-300 dark:bg-neutral-700'
                   }`}
                 >
                   <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-transform ${
-                    active ? 'translate-x-6' : 'translate-x-0'
+                    resourceAiActive ? 'translate-x-6' : 'translate-x-0'
                   }`} />
                 </button>
               </div>
@@ -79,11 +80,11 @@ export function ResourceAI() {
             <div className="mt-6 h-2 rounded-full bg-neutral-100 dark:bg-neutral-800 overflow-hidden">
               <div
                 className={`h-full rounded-full transition-all duration-1000 ${
-                  active
+                  resourceAiActive
                     ? 'bg-gradient-to-r from-primary-500 to-emerald-500'
                     : 'bg-gradient-to-r from-rose-500 to-amber-500'
                 }`}
-                style={{ width: active ? '30%' : '85%' }}
+                style={{ width: resourceAiActive ? '30%' : '85%' }}
               />
             </div>
           </div>

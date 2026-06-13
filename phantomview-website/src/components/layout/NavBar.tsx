@@ -1,5 +1,5 @@
 ﻿import { useState, useEffect } from 'react';
-import { Eye, Menu, X, Moon, Sun, Download, Globe, LayoutDashboard } from 'lucide-react';
+import { Eye, Menu, X, Moon, Sun, Download, LayoutDashboard } from 'lucide-react';
 import { useTheme } from '../../hooks/useTheme';
 
 const NAV_LINKS = [

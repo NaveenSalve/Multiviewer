@@ -1,15 +1,37 @@
-import React, { useRef } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import React, { useRef, useEffect } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { useAppStore } from '../store/useAppStore';
+
+function useIsVisible() {
+  const { gl } = useThree();
+  const [visible, setVisible] = React.useState(true);
+
+  React.useEffect(() => {
+    const el = gl.domElement;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: 0 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [gl.domElement]);
+
+  return visible;
+}
 
 function AnimatedBars() {
   const { resourceAiActive } = useAppStore();
   
   // 8 bars
   const barsRef = useRef<THREE.Mesh[]>([]);
+  const plateRef = useRef<THREE.Mesh>(null!);
+
+  const visible = useIsVisible();
 
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = clock.getElapsedTime();
     barsRef.current.forEach((mesh, idx) => {
       if (!mesh) return;
@@ -27,6 +49,29 @@ function AnimatedBars() {
     });
   });
 
+  useEffect(() => {
+    return () => {
+      barsRef.current.forEach(mesh => {
+        if (mesh) {
+          mesh.geometry?.dispose();
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach(m => m.dispose());
+          } else {
+            mesh.material?.dispose();
+          }
+        }
+      });
+      if (plateRef.current) {
+        plateRef.current.geometry?.dispose();
+        if (Array.isArray(plateRef.current.material)) {
+          plateRef.current.material.forEach(m => m.dispose());
+        } else {
+          plateRef.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
+
   const barConfigs = [
     { x: -2.8, color: '#7B5CFA' },
     { x: -2.0, color: '#00D4FF' },
@@ -41,7 +86,7 @@ function AnimatedBars() {
   return (
     <group>
       {/* Base Grid Plate */}
-      <mesh position={[0, -1.6, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+      <mesh ref={plateRef} position={[0, -1.6, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[7, 2]} />
         <meshStandardMaterial color="#161920" roughness={0.6} />
       </mesh>

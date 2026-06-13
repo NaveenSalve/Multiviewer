@@ -1,16 +1,50 @@
-import React, { useRef, useState } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import React, { useRef, useState, useEffect } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+
+function useIsVisible() {
+  const { gl } = useThree();
+  const [visible, setVisible] = React.useState(true);
+
+  React.useEffect(() => {
+    const el = gl.domElement;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: 0 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [gl.domElement]);
+
+  return visible;
+}
 
 function GlobeWireframe() {
   const globeRef = useRef<THREE.Mesh>(null!);
 
+  const visible = useIsVisible();
+
   useFrame((_, delta) => {
+    if (!visible) return;
     if (globeRef.current) {
       globeRef.current.rotation.y += delta * 0.15;
       globeRef.current.rotation.x += delta * 0.05;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (globeRef.current) {
+        globeRef.current.geometry?.dispose();
+        if (Array.isArray(globeRef.current.material)) {
+          globeRef.current.material.forEach(m => m.dispose());
+        } else {
+          globeRef.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
 
   return (
     <mesh ref={globeRef}>
@@ -27,8 +61,23 @@ function GlobeWireframe() {
 
 // Inner Core
 function InnerCore() {
+  const coreRef = useRef<THREE.Mesh>(null!);
+
+  useEffect(() => {
+    return () => {
+      if (coreRef.current) {
+        coreRef.current.geometry?.dispose();
+        if (Array.isArray(coreRef.current.material)) {
+          coreRef.current.material.forEach(m => m.dispose());
+        } else {
+          coreRef.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
+
   return (
-    <mesh>
+    <mesh ref={coreRef}>
       <sphereGeometry args={[1.2, 32, 32]} />
       <meshStandardMaterial
         color="#0E1014"
@@ -45,7 +94,10 @@ function DeflectionShield() {
   const shieldRef = useRef<THREE.Mesh>(null!);
   const [hit, setHit] = useState(false);
 
+  const visible = useIsVisible();
+
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = clock.getElapsedTime();
     if (shieldRef.current) {
       // Shield pulsing
@@ -55,12 +107,25 @@ function DeflectionShield() {
   });
 
   // Periodically trigger deflection flash
-  React.useEffect(() => {
+  useEffect(() => {
     const interval = setInterval(() => {
       setHit(true);
       setTimeout(() => setHit(false), 300);
     }, 2000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (shieldRef.current) {
+        shieldRef.current.geometry?.dispose();
+        if (Array.isArray(shieldRef.current.material)) {
+          shieldRef.current.material.forEach(m => m.dispose());
+        } else {
+          shieldRef.current.material?.dispose();
+        }
+      }
+    };
   }, []);
 
   return (
@@ -80,7 +145,10 @@ function DeflectionShield() {
 function DeflectingBeams() {
   const beamsGroupRef = useRef<THREE.Group>(null!);
 
+  const visible = useIsVisible();
+
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = clock.getElapsedTime() * 2;
     if (beamsGroupRef.current) {
       beamsGroupRef.current.rotation.z = t * 0.1;
@@ -105,7 +173,10 @@ function DeflectingBeams() {
 function BeamMesh({ angle, speed }: { angle: number; speed: number }) {
   const meshRef = useRef<THREE.Mesh>(null!);
 
+  const visible = useIsVisible();
+
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = (clock.getElapsedTime() * speed) % 2;
     if (meshRef.current) {
       // Animate beam in and bounce out
@@ -115,6 +186,19 @@ function BeamMesh({ angle, speed }: { angle: number; speed: number }) {
       meshRef.current.rotation.z = angle;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (meshRef.current) {
+        meshRef.current.geometry?.dispose();
+        if (Array.isArray(meshRef.current.material)) {
+          meshRef.current.material.forEach(m => m.dispose());
+        } else {
+          meshRef.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
 
   return (
     <mesh ref={meshRef}>

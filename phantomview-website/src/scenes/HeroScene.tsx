@@ -1,6 +1,24 @@
-import React, { useRef } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+
+function useIsVisible() {
+  const { gl } = useThree();
+  const [visible, setVisible] = React.useState(true);
+
+  React.useEffect(() => {
+    const el = gl.domElement;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: 0 }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [gl.domElement]);
+
+  return visible;
+}
 
 // 1000 Stars / Particles
 function ParticleField() {
@@ -15,12 +33,28 @@ function ParticleField() {
     return pos;
   });
 
+  const visible = useIsVisible();
+
   useFrame((_, delta) => {
+    if (!visible) return;
     if (ref.current) {
       ref.current.rotation.y += delta * 0.02;
       ref.current.rotation.x += delta * 0.01;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (ref.current) {
+        ref.current.geometry?.dispose();
+        if (Array.isArray(ref.current.material)) {
+          ref.current.material.forEach(m => m.dispose());
+        } else {
+          ref.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
 
   return (
     <points ref={ref}>
@@ -45,12 +79,28 @@ function ParticleField() {
 function GlowingTorus() {
   const torusRef = useRef<THREE.Mesh>(null!);
 
+  const visible = useIsVisible();
+
   useFrame((_, delta) => {
+    if (!visible) return;
     if (torusRef.current) {
       torusRef.current.rotation.y += delta * 0.2;
       torusRef.current.rotation.x += delta * 0.1;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (torusRef.current) {
+        torusRef.current.geometry?.dispose();
+        if (Array.isArray(torusRef.current.material)) {
+          torusRef.current.material.forEach(m => m.dispose());
+        } else {
+          torusRef.current.material?.dispose();
+        }
+      }
+    };
+  }, []);
 
   return (
     <mesh ref={torusRef}>
@@ -73,13 +123,33 @@ function OrbitingPanels() {
   // Colors for the 6 engines
   const engineColors = ['#7B5CFA', '#00D4FF', '#F59E0B', '#10B981', '#EC4899', '#6366F1'];
 
+  const visible = useIsVisible();
+
   useFrame(({ clock }) => {
+    if (!visible) return;
     const t = clock.getElapsedTime() * 0.3;
     if (groupRef.current) {
       groupRef.current.rotation.y = t;
       groupRef.current.position.y = Math.sin(t * 2) * 0.1;
     }
   });
+
+  useEffect(() => {
+    return () => {
+      if (groupRef.current) {
+        groupRef.current.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry?.dispose();
+            if (Array.isArray(child.material)) {
+              child.material.forEach(m => m.dispose());
+            } else {
+              child.material?.dispose();
+            }
+          }
+        });
+      }
+    };
+  }, []);
 
   return (
     <group ref={groupRef}>
@@ -116,7 +186,10 @@ function OrbitingPanels() {
 function CameraController() {
   const { camera, mouse } = useThree();
 
+  const visible = useIsVisible();
+
   useFrame(() => {
+    if (!visible) return;
     const targetX = mouse.x * 0.6;
     const targetY = mouse.y * 0.6;
     camera.position.set(

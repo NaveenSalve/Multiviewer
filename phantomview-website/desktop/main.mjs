@@ -60,6 +60,11 @@ const server = http.createServer((req, res) => {
 
   // POST /start — begin farming
   if (path === '/start' && req.method === 'POST') {
+    if (engine.running) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Farm already running. Stop first.' }));
+      return;
+    }
     let body = '';
     req.on('data', c => body += c);
     req.on('end', () => {
@@ -71,7 +76,11 @@ const server = http.createServer((req, res) => {
         if (typeof data.headless === 'boolean') engine.headless = data.headless;
         if (typeof data.concurrency === 'number') engine.concurrency = Math.max(1, Math.min(data.concurrency, 15));
         engine.setProxies(data.proxies);
-        engine.start(data.url).catch(err => console.error('[Farm] Error:', err.message));
+        engine.start(data.url).catch(err => {
+          console.error('[Farm] Error:', err.message);
+          engine.running = false;
+          engine.stats.viewsSent = 0;
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -79,6 +88,13 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // GET /screenshots — live browser screenshots
+  if (path === '/screenshots') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(engine.getScreenshots()));
     return;
   }
 
@@ -114,3 +130,13 @@ server.listen(PORT, () => {
   console.log(`[PhantomView Desktop] Farm API on http://localhost:${PORT}`);
   console.log(`[PhantomView Desktop] Open browser UI and switch to "Desktop Mode"`);
 });
+
+// Cleanup on exit — kill orphaned browser processes
+async function cleanup() {
+  console.log('[PhantomView] Shutting down farm...');
+  engine.running = false;
+  await engine._clearPool();
+  process.exit(0);
+}
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);

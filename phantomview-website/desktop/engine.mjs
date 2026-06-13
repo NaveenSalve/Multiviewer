@@ -2,12 +2,11 @@ import puppeteer from 'puppeteer-core';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 
 const VIEWPORT_SIZES = [
-  { w: 1366, h: 768 }, { w: 1440, h: 900 }, { w: 1536, h: 864 },
-  { w: 1600, h: 900 }, { w: 1280, h: 720 }, { w: 1920, h: 1080 },
-  { w: 1360, h: 768 }, { w: 1400, h: 900 }, { w: 1680, h: 1050 },
-  { w: 1280, h: 800 }, { w: 1440, h: 810 }, { w: 1600, h: 1000 },
+  { width: 1280, height: 720 }, { width: 1280, height: 800 },
+  { width: 1360, height: 768 }, { width: 1366, height: 768 },
 ];
 const EDGE_PATHS = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -65,6 +64,9 @@ export class FarmEngine {
     this.viewsPerBrowser = 50;
     this._browserPool = [];
     this._activeViews = [];
+    this._browserLaunchCounter = 0;
+    this._proxyPollInterval = null;
+    this._bankUrl = 'http://localhost:3456';
   }
 
   onEvent(cb) {
@@ -73,6 +75,21 @@ export class FarmEngine {
 
   _emit(name, data) {
     if (this._onEvent) this._onEvent({ name, ...data, stats: { ...this.stats } });
+  }
+
+  getScreenshots() {
+    return this._browserPool
+      .filter(e => e.screenshot)
+      .map(e => ({
+        id: e.proxyLabel || 'direct',
+        proxy: e.proxyLabel || 'direct',
+        screenshot: e.screenshot,
+        width: e.page?.viewport()?.width || 0,
+        height: e.page?.viewport()?.height || 0,
+        viewsDone: e.viewsDone,
+        busy: e.busy,
+        age: Date.now() - (e.screenshotAt || Date.now()),
+      }));
   }
 
   getStatus() {
@@ -101,16 +118,66 @@ export class FarmEngine {
     this.proxies = list;
   }
 
+  async fetchFromProxyBank() {
+    try {
+      const r = await fetch('http://localhost:3456/proxy-bank/pool?n=10', { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      if (d.ok && d.proxies.length > 0) {
+        const parsed = d.proxies.map(p => {
+          const parts = p.split(':');
+          return { host: parts[0], port: parseInt(parts[1]), type: 'http', user: '', pass: '' };
+        }).filter(p => p.host && p.port);
+        if (parsed.length > 0) {
+          this.proxies = parsed;
+          console.log(`[FarmEngine] Fetched ${parsed.length} proxies from bank`);
+          return true;
+        }
+      }
+    } catch (err) {
+      console.log(`[FarmEngine] Proxy bank fetch failed: ${err.message}`);
+    }
+    return false;
+  }
+
+  // Poll proxy bank every 1s — adds to pool as they come
+  async _pollProxyBank() {
+    while (this.running) {
+      try {
+        const r = await fetch(`${this._bankUrl}/proxy-bank/next`, { signal: AbortSignal.timeout(2000) });
+        const d = await r.json();
+        if (d.ok && d.proxy) {
+          const parts = d.proxy.split(':');
+          const pObj = { host: parts[0], port: parseInt(parts[1]), type: 'http', user: '', pass: '', label: `${parts[0]}:${parseInt(parts[1])}` };
+          if (!this.proxies.find(p => p.host === pObj.host && p.port === pObj.port)) {
+            this.proxies.push(pObj);
+          }
+        }
+      } catch (e) { console.error(`[FarmEngine] Proxy poll error: ${e.message}`); }
+      await delay(1000);
+    }
+  }
+
+  // Grab a proxy from the pool (block until one available)
+  async _waitForProxy(timeout = 120000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (!this.running) return null;
+      if (this.proxies.length > 0) {
+        const idx = this.currentIndex++ % this.proxies.length;
+        return this.proxies[idx];
+      }
+      await delay(500);
+    }
+    return null;
+  }
+
   async start(targetUrl) {
     const browserInfo = findBrowser();
     if (!browserInfo) {
       throw new Error('No Edge/Chrome found. Install Microsoft Edge or Google Chrome.');
     }
-    if (!this.allowDirect && (!this.proxies || this.proxies.length === 0)) {
-      throw new Error('No proxies configured. Set engine.allowDirect = true to allow direct connections, or provide proxies.');
-    }
 
-    this._clearPool();
+    await this._clearPool();
     this.running = true;
     this.paused = false;
     this.url = targetUrl;
@@ -119,7 +186,33 @@ export class FarmEngine {
 
     this._emit('start', { browser: browserInfo.type });
 
-    const maxConcurrent = Math.max(1, Math.min(this.concurrency, this.proxies.length || 1, 15));
+    // A1: User provided proxies (via setProxies) — use them directly
+    if (this.proxies.length > 0) {
+      console.log(`[FarmEngine] Using ${this.proxies.length} user-provided proxies`);
+    } else {
+      // 1. Try to fetch existing proxies from bank first
+      console.log('[FarmEngine] Checking proxy bank for existing proxies...');
+      let hasProxies = await this.fetchFromProxyBank();
+
+      // 2. If no proxies, trigger harvest and WAIT for it
+      if (!hasProxies) {
+        console.log('[FarmEngine] No proxies in bank, running harvest (may take 2-5 min)...');
+        try {
+          const r = await fetch(`${this._bankUrl}/proxy-engine/harvest`, { signal: AbortSignal.timeout(300000) });
+          const data = await r.json();
+          console.log(`[FarmEngine] Harvest complete: ${data.alive || 0} live proxies found`);
+          hasProxies = await this.fetchFromProxyBank();
+        } catch (e) {
+          console.error(`[FarmEngine] Harvest failed: ${e.message}`);
+        }
+      } else {
+        console.log(`[FarmEngine] Using ${this.proxies.length} existing proxies from bank`);
+      }
+    }
+
+    // 3. Start polling bank every 1s for new proxies
+    this._proxyPollInterval = setInterval(() => this._pollProxyBank(), 1000);
+
     this._activeViews = [];
 
     const worker = async () => {
@@ -129,36 +222,38 @@ export class FarmEngine {
         }
         if (!this.running) break;
 
-        const idx = this.currentIndex++;
-        const proxy = this.proxies.length > 0
-          ? this.proxies[idx % this.proxies.length]
-          : null;
+        const proxy = await this._waitForProxy();
+        if (!proxy) continue;
 
         try {
-          const viewPromise = this._launchView(targetUrl, proxy, browserInfo.path);
-          this._activeViews.push(viewPromise);
-          await viewPromise;
+          const proxyLabel = proxy.label;
+          await this._launchView(targetUrl, proxy, browserInfo.path);
           this.stats.viewsSent++;
-          this._emit('view', { proxy: proxy?.label || 'direct', index: idx + 1 });
+          this._emit('view', { proxy: proxyLabel, index: this.stats.viewsSent });
         } catch (err) {
-          this._emit('error', { proxy: proxy?.label || 'direct', error: err.message });
+          this.proxies = this.proxies.filter(p => p.host !== proxy?.host || p.port !== proxy?.port);
+          this._emit('error', { proxy: proxy?.label || 'unknown', error: String(err) });
         }
         this.stats.cycles++;
       }
     };
 
+    const maxConcurrent = Math.max(1, Math.min(this.concurrency, 10));
     const workers = [];
     for (let i = 0; i < maxConcurrent; i++) {
       workers.push(worker());
     }
     await Promise.all(workers);
 
-    this._clearPool();
+    await this._clearPool();
+    if (this._proxyPollInterval) { clearInterval(this._proxyPollInterval); this._proxyPollInterval = null; }
+    this.running = false;
     this._emit('stop', {});
   }
 
   stop() {
     this.running = false;
+    if (this._proxyPollInterval) { clearInterval(this._proxyPollInterval); this._proxyPollInterval = null; }
   }
 
   pause() {
@@ -191,7 +286,9 @@ export class FarmEngine {
   }
 
   async _createBrowser(proxy, execPath) {
-    const profileDir = `${this._profilePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const profileDir = `${this._profilePrefix}-${Date.now()}-${this._browserLaunchCounter++}`;
+    // Clean up any leftover profile dir from previous run
+    try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (e) { console.error(`[FarmEngine] Cleanup profile error: ${e.message}`); }
     const browserArgs = [
       '--no-first-run',
       '--no-default-browser-check',
@@ -199,8 +296,9 @@ export class FarmEngine {
       '--disable-extensions',
       '--disable-webrtc',
       '--enforce-webrtc-permission-check',
-      '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost',
       '--disable-background-networking',
+      '--proxy-bypass-list=<-loopback>',
+      '--disable-features=UseDnsHttpsSvcb,WebRtcRemoteEventLog',
       '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows',
       '--disable-breakpad',
@@ -218,12 +316,22 @@ export class FarmEngine {
       '--discard-yield-to-tasks',
       '--no-crash-upload',
       '--no-pings',
+      '--disable-gpu',
+      '--disable-accelerated-video-decode',
+      '--disable-accelerated-video-encode',
+      '--disable-accelerated-2d-canvas',
+      '--disable-features=VizDisplayCompositor',
+      '--disable-features=CanvasOopRasterization',
+      '--force-device-scale-factor=1',
       `--user-data-dir=${profileDir}`,
     ];
 
     if (proxy) {
       const proxyProto = proxy.type === 'socks5' ? 'socks5' : 'http';
       browserArgs.push(`--proxy-server=${proxyProto}://${proxy.host}:${proxy.port}`);
+      if (proxy.type === 'socks5') {
+        browserArgs.push('--proxy-dns');
+      }
     }
 
     const browser = await puppeteer.launch({
@@ -232,6 +340,7 @@ export class FarmEngine {
       args: browserArgs,
       defaultViewport: null,
       ignoreDefaultArgs: ['--enable-automation'],
+      timeout: 25000,
     });
 
     const page = await browser.newPage();
@@ -273,20 +382,33 @@ export class FarmEngine {
       Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
     });
 
-    return { browser, page, viewsDone: 0, profileDir, busy: false, proxy };
+    return { browser, page, viewsDone: 0, profileDir, busy: false, proxy, screenshot: null, screenshotAt: 0 };
   }
 
   async _recycleBrowser(entry) {
-    try { await entry.browser.close(); } catch {}
-    try { fs.rmSync(entry.profileDir, { recursive: true, force: true }); } catch {}
+    try {
+      const pid = entry.browser?.process()?.pid;
+      await entry.browser.close();
+      // Force-kill orphan child processes on Windows
+      if (pid) {
+        try { execSync(`taskkill /F /T /PID ${pid} 2>nul`, { stdio: 'ignore' }); } catch (e) { console.error(`[FarmEngine] Recycle taskkill error: ${e.message}`); }
+      }
+    } catch (e) { console.error(`[FarmEngine] Recycle browser close error: ${e.message}`); }
+    try { fs.rmSync(entry.profileDir, { recursive: true, force: true }); } catch (e) { console.error(`[FarmEngine] Recycle profile cleanup error: ${e.message}`); }
     const idx = this._browserPool.indexOf(entry);
     if (idx >= 0) this._browserPool.splice(idx, 1);
   }
 
-  _clearPool() {
+  async _clearPool() {
     for (const entry of this._browserPool) {
-      try { entry.browser.close(); } catch {}
-      try { fs.rmSync(entry.profileDir, { recursive: true, force: true }); } catch {}
+      try {
+        const pid = entry.browser?.process()?.pid;
+        await entry.browser.close();
+        if (pid) {
+          try { execSync(`taskkill /F /T /PID ${pid} 2>nul`, { stdio: 'ignore' }); } catch (e) { console.error(`[FarmEngine] ClearPool taskkill error: ${e.message}`); }
+        }
+      } catch (e) { console.error(`[FarmEngine] ClearPool browser close error: ${e.message}`); }
+      try { fs.rmSync(entry.profileDir, { recursive: true, force: true }); } catch (e) { console.error(`[FarmEngine] ClearPool profile cleanup error: ${e.message}`); }
     }
     this._browserPool = [];
   }
@@ -315,6 +437,11 @@ export class FarmEngine {
           '.btn-close',
           '.dismiss-button',
           'button:has(svg)',
+          // LinkedIn-specific
+          'button[data-tracking-control-name*="guest-modal"]',
+          '.sign-in-modal button[aria-label="Dismiss"]',
+          '.auth-wall button[aria-label="Dismiss"]',
+          'button[aria-label="Dismiss sign-in modal"]',
         ];
         for (const sel of selectors) {
           try {
@@ -324,10 +451,10 @@ export class FarmEngine {
                 el.click();
               }
             }
-          } catch {}
+          } catch (e) { console.error(`[FarmEngine] Overlay click error: ${e.message}`); }
         }
       });
-    } catch {}
+    } catch (e) { console.error(`[FarmEngine] Close overlays evaluate error: ${e.message}`); }
   }
 
   async _launchView(url, proxy, execPath) {
@@ -345,21 +472,44 @@ export class FarmEngine {
 
       this.stats.activeView = true;
 
-      await poolEntry.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await poolEntry.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
       await delay(randomBetween(500, 1500));
       await this._closeOverlays(poolEntry.page);
 
+      // Capture screenshot for UI preview
+      try {
+        poolEntry.screenshot = await poolEntry.page.screenshot({ type: 'jpeg', quality: 30, encoding: 'base64' });
+        poolEntry.screenshotAt = Date.now();
+      } catch (e) { console.error(`[FarmEngine] Screenshot error: ${e.message}`); poolEntry.screenshot = null; }
+
       const watchTime = getViewDuration(this.fastMode, url);
       const startTime = Date.now();
+      let lastHealthCheck = 0;
+      let failCount = 0;
 
       while (Date.now() - startTime < watchTime && this.running) {
         await delay(randomBetween(3000, 8000));
+
+        // Proxy health check every 10s
+        if (Date.now() - lastHealthCheck > 10000) {
+          lastHealthCheck = Date.now();
+          const alive = await poolEntry.page.evaluate(() =>
+            fetch('http://checkip.amazonaws.com', { mode: 'no-cors' }).then(r => true).catch(() => false)
+          ).catch(() => false);
+          if (alive) {
+            failCount = 0;
+          } else {
+            failCount++;
+            if (failCount >= 2) throw new Error('Proxy died during view');
+          }
+        }
+
         try {
           await poolEntry.page.evaluate(() => {
             window.scrollTo({ top: Math.floor(Math.random() * 500), behavior: 'smooth' });
           });
-        } catch {}
+          } catch (e) { console.error(`[FarmEngine] Scroll error: ${e.message}`); }
       }
 
       poolEntry.viewsDone++;

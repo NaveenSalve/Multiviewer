@@ -1,6 +1,6 @@
 # PhantomView OS
 
-Professional multi-workspace cinematic surveillance app with desktop farm engine.
+Professional multi-workspace surveillance app with headless desktop farm engine.
 
 ## Architecture
 
@@ -9,14 +9,14 @@ Professional multi-workspace cinematic surveillance app with desktop farm engine
 │                  React UI (Vite)                     │
 │  ┌──────────────────────────────────────────────┐   │
 │  │          MissionControlV24                   │   │
-│  │  ┌────────┐  ┌──────────┐  ┌─────────────┐  │   │
-│  │  │ Popup  │  │  Iframe  │  │   Desktop   │  │   │
-│  │  │ Mode   │  │  Mode    │  │   Mode      │  │   │
-│  │  └────────┘  └──────────┘  └──────┬──────┘  │   │
-│  └────────────────────────────────────┼─────────┘   │
-└───────────────────────────────────────┼─────────────┘
-                                        │ HTTP API
-┌───────────────────────────────────────▼─────────────┐
+│  │  ┌──────────┐  ┌─────────────┐              │   │
+│  │  │  Iframe  │  │   Desktop   │              │   │
+│  │  │  Mode    │  │   Mode      │              │   │
+│  │  └──────────┘  └──────┬──────┘              │   │
+│  └────────────────────────┼─────────────────────┘   │
+└───────────────────────────┼─────────────────────────┘
+                            │ HTTP API
+┌───────────────────────────▼─────────────────────────┐
 │              Desktop Engine (Node.js)                │
 │  ┌──────────────────────────────────────────────┐   │
 │  │           FarmEngine                          │   │
@@ -25,26 +25,29 @@ Professional multi-workspace cinematic surveillance app with desktop farm engine
 │  │  │ Browsers   │  │  Router  │  │  Logger │  │   │
 │  │  └────────────┘  └──────────┘  └─────────┘  │   │
 │  └──────────────────────────────────────────────┘   │
-└───────────────────────────────────────┬─────────────┘
-                                        │
-┌───────────────────────────────────────▼─────────────┐
+└───────────────────────────────────┬─────────────────┘
+                                    │
+┌───────────────────────────────────▼─────────────────┐
 │              Proxy Server (Node.js)                  │
-│  HTTP CONNECT + SOCKS5 tunnel + HTML rewrite        │
+│  Shared proxy-lib (HTTP CONNECT + SOCKS5 tunnel)    │
+│  + Proxy Harvester + Proxy Bank (persistent pool)   │
 └─────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **View Farm** — Real browser automation via Puppeteer for traffic generation
-- **Three Modes** — Popup (real tabs), Iframe (embedded), Desktop (Puppeteer pool)
+- **Desktop Farm** — Headless Puppeteer browser pool for traffic generation
+- **Two Modes** — Desktop (headless farm, screenshots in UI) or Iframe (in-page embed)
 - **Proxy Rotation** — HTTP/SOCKS5 proxy chaining with auto IP rotation
+- **Proxy Bank** — Persistent pool of verified proxies, auto-refresh every 5 min
+- **Proxy Harvester** — Scrapes 50+ free proxy sources, tests via HTTPS (api.ipify.org)
 - **Anti-Detection** — WebRTC block, DNS force, fingerprint injection, canvas noise
 - **Browser Pool** — 10 headless browsers reused across views (~650 MB RAM)
 - **Content-Aware Timing** — Video(8-15s) / Image(2-5s) / Article(4-8s) auto-detection
 - **Overlay Close** — Auto-dismisses signup/cookie/newsletter popups
-- **Proxy Scraper** — Built-in free proxy fetcher from multiple sources
 - **Per-tab Viewport** — Random screen sizes, referral params, behavioral patterns
 - **Privacy Engine** — WebRTC kill, isolated partitions, temp profile cleanup
+- **Shared Testing Lib** — `proxy-lib.mjs` with unified HTTPS proxy testing for both server and harvester
 
 ## Getting Started
 
@@ -89,10 +92,11 @@ Then open **http://localhost:5173**
 ### Usage
 
 1. Enter target URL
-2. Select **Desktop** mode
+2. Select **Desktop** mode (default)
 3. Paste proxies (IP:PORT or socks5://IP:PORT)
 4. Toggle Fast Mode for 5-10s views
-5. Click **Launch**
+5. Click **Launch View**
+6. Screenshots appear in UI — no browser windows open
 
 ## API Endpoints
 
@@ -102,6 +106,9 @@ Then open **http://localhost:5173**
 |---|---|---|
 | `/health` | GET | Health check |
 | `/proxy?url=TARGET&proxy=IP:PORT` | GET | Fetch URL through proxy |
+| `/proxy-bank/status` | GET | Proxy pool status |
+| `/proxy-engine/harvest` | GET | Scrape & test new proxies |
+| `/proxy-engine/status` | GET | Harvester status |
 | `/test-proxy?proxy=IP:PORT` | GET | Test proxy connectivity |
 | `/scrape-proxies` | GET | Fetch free public proxies |
 
@@ -115,6 +122,7 @@ Then open **http://localhost:5173**
 | `/stop` | POST | — | Stop all browsers |
 | `/pause` | POST | — | Pause views |
 | `/resume` | POST | — | Resume views |
+| `/screenshots` | GET | — | Live base64 screenshots |
 
 ## Stack
 
@@ -122,11 +130,12 @@ Then open **http://localhost:5173**
 |---|---|
 | Frontend | React 19 + TypeScript 6 + Vite 8 |
 | Styling | Tailwind CSS 3 + Framer Motion |
-| Backend | Node.js + Puppeteer Core |
+| Backend | Node.js + Puppeteer Core 24 |
 | 3D | React Three Fiber + Drei |
 | State | Zustand 5 |
 | Icons | Lucide React |
 | Proxy | socks (SOCKS5) |
+| Shared Lib | `proxy-lib.mjs` (unified HTTP/SOCKS5 testing) |
 
 ## License
 

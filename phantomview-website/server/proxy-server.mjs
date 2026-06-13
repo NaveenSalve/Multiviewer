@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────
-// PhantomView OS — Local Proxy Server
+// PhantomView OS — Local Proxy Server v3
 // Routes requests through user-specified HTTP/HTTPS/SOCKS5 proxies
 // Run: node server/proxy-server.mjs
 // ──────────────────────────────────────────────
@@ -8,165 +8,162 @@ import http from 'http';
 import https from 'https';
 import net from 'net';
 import { URL } from 'url';
+import fs from 'fs';
+import path from 'path';
 import { SocksClient } from 'socks';
+import { ProxyHarvester } from './proxy-engine.mjs';
+import { parseProxy, fetchThroughProxy, getRandomUA, fastTestProxy, fastTestBatch } from './proxy-lib.mjs';
 
 const PORT = parseInt(process.env.PROXY_PORT || '3456', 10);
 const TIMEOUT = 30000;
+const PROXY_DATA_DIR = path.join(process.cwd(), 'data');
+const PROXY_DATA_FILE = path.join(PROXY_DATA_DIR, 'live-proxies.json');
 
-// ── Parse proxy string ──
-// Formats: IP:PORT, IP:PORT:USER:PASS, socks5://IP:PORT, socks5://IP:PORT:USER:PASS
-function parseProxy(str) {
-  if (!str || typeof str !== 'string') return null;
-  let raw = str.trim();
-
-  let type = 'http'; // default
-  if (raw.startsWith('socks5://') || raw.startsWith('socks://')) {
-    type = 'socks5';
-    raw = raw.replace(/^(socks5?:\/\/)/, '');
+// ── Proxy Bank — Persistent pool of working proxies with round-robin ──
+class ProxyBank {
+  constructor() {
+    this.pool = [];
+    this.index = 0;
+    this._cleanInterval = null;
+    this._fillInterval = null;
+    this.cleanMinutes = 5;
+    this.fillMinutes = 5;
+    this._filling = false;
   }
 
-  const lastColon = raw.lastIndexOf(':');
-  if (lastColon < 1) return null;
-
-  // Try to find port — the last colon-separated segment that's a number
-  const parts = raw.split(':');
-  const port = parseInt(parts[parts.length - 1], 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
-    // Try second-to-last as port
-    const port2 = parseInt(parts[parts.length - 2], 10);
-    if (isNaN(port2) || port2 < 1 || port2 > 65535) return null;
-    return {
-      type,
-      host: parts.slice(0, parts.length - 2).join(':'),
-      port: port2,
-      user: parts[parts.length - 1],
-      pass: '',
-      label: `${parts.slice(0, parts.length - 2).join(':')}:${port2}`,
-    };
-  }
-
-  if (parts.length === 2) {
-    return { type, host: parts[0], port, user: '', pass: '', label: raw };
-  }
-  if (parts.length === 3) {
-    return null; // invalid
-  }
-  if (parts.length === 4) {
-    return { type, host: parts[0], port, user: parts[2], pass: parts[3], label: `${parts[0]}:${port}` };
-  }
-  if (parts.length >= 5) {
-    // IP:PORT:USER:PASS where IP could be IPv6
-    return { type, host: parts[0], port, user: parts[2], pass: parts.slice(3).join(':'), label: `${parts[0]}:${port}` };
-  }
-  return null;
-}
-
-// ── HTTP CONNECT tunnel through proxy ──
-function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, auth) {
-  return new Promise((resolve, reject) => {
-    const socket = new net.Socket();
-    const timeout = setTimeout(() => {
-      socket.destroy();
-      reject(new Error('CONNECT tunnel timeout'));
-    }, TIMEOUT);
-
-    socket.connect(proxyPort, proxyHost, () => {
-      const connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth ? `Proxy-Authorization: Basic ${auth}\r\n` : ''}\r\n`;
-      socket.write(connectReq);
-    });
-
-    socket.once('data', (data) => {
-      const response = data.toString();
-      if (response.includes('200') || response.includes('HTTP/1.1 200') || response.includes('HTTP/1.0 200')) {
-        clearTimeout(timeout);
-        resolve(socket);
-      } else {
-        clearTimeout(timeout);
-        socket.destroy();
-        reject(new Error(`CONNECT failed: ${response.slice(0, 100)}`));
+  // Load saved proxies from disk
+  loadFromDisk() {
+    try {
+      if (!fs.existsSync(PROXY_DATA_DIR)) fs.mkdirSync(PROXY_DATA_DIR, { recursive: true });
+      if (fs.existsSync(PROXY_DATA_FILE)) {
+        const raw = fs.readFileSync(PROXY_DATA_FILE, 'utf-8');
+        const data = JSON.parse(raw);
+        if (Array.isArray(data.proxies)) {
+          this.pool = data.proxies.filter(p => typeof p === 'string' && p.trim());
+          this.index = data.index || 0;
+          console.log(`[ProxyBank] Loaded ${this.pool.length} proxies from disk`);
+        }
       }
-    });
-
-    socket.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-}
-
-// ── Fetch URL through proxy ──
-async function fetchThroughProxy(targetUrl, proxyInfo) {
-  const url = new URL(targetUrl);
-  const isHttps = url.protocol === 'https:';
-  const targetPort = parseInt(url.port, 10) || (isHttps ? 443 : 80);
-  const auth = proxyInfo.user ? Buffer.from(`${proxyInfo.user}:${proxyInfo.pass}`).toString('base64') : null;
-
-  let tunnelSocket;
-
-  if (proxyInfo.type === 'socks5') {
-    // SOCKS5
-    const destination = { host: url.hostname, port: targetPort };
-    const proxy = {
-      host: proxyInfo.host,
-      port: proxyInfo.port,
-      userId: proxyInfo.user || undefined,
-      password: proxyInfo.pass || undefined,
-    };
-    const conn = await SocksClient.createConnection({ destination, proxy, command: 'connect', timeout: TIMEOUT });
-    tunnelSocket = conn.socket;
-  } else {
-    // HTTP CONNECT tunnel
-    tunnelSocket = await httpConnectTunnel(proxyInfo.host, proxyInfo.port, url.hostname, targetPort, auth);
+    } catch (err) {
+      console.log(`[ProxyBank] Disk load error: ${err.message}`);
+    }
   }
 
-  return new Promise((resolve, reject) => {
-    const selectedUA = getRandomUA();
-    const chromeVersion = selectedUA.match(/Chrome\/(\d+)/)?.[1] || '125';
-    const secChUa = `"Google Chrome";v="${chromeVersion}", "Chromium";v="${chromeVersion}", "Not.A/Brand";v="24"`;
-    const platform = selectedUA.includes('Windows') ? 'Windows' : selectedUA.includes('Mac') ? 'macOS' : 'Linux';
-    const headers = {
-      'Host': url.hostname,
-      'User-Agent': getRandomUA(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-CH-UA': secChUa,
-      'Sec-CH-UA-Mobile': '?0',
-      'Sec-CH-UA-Platform': `"${platform}"`,
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-User': '?1',
-      'Cache-Control': 'max-age=0',
+  // Save current pool to disk
+  saveToDisk() {
+    try {
+      if (!fs.existsSync(PROXY_DATA_DIR)) fs.mkdirSync(PROXY_DATA_DIR, { recursive: true });
+      fs.writeFileSync(PROXY_DATA_FILE, JSON.stringify({ proxies: this.pool, index: this.index, savedAt: Date.now() }));
+    } catch (err) {
+      console.log(`[ProxyBank] Disk save error: ${err.message}`);
+    }
+  }
+
+  start() {
+    this.loadFromDisk();
+    // Clean dead proxies every 5 min
+    this._cleanInterval = setInterval(() => this.cleanDead(), this.cleanMinutes * 60000);
+    // Fill pool every 5 min
+    this._fillInterval = setInterval(() => this.fill(), this.fillMinutes * 60000);
+    console.log(`[ProxyBank] Started — pool: ${this.pool.length}, clean every ${this.cleanMinutes}min, fill every ${this.fillMinutes}min`);
+  }
+
+  stop() {
+    this.saveToDisk();
+    if (this._cleanInterval) { clearInterval(this._cleanInterval); this._cleanInterval = null; }
+    if (this._fillInterval) { clearInterval(this._fillInterval); this._fillInterval = null; }
+  }
+
+  get size() { return this.pool.length; }
+  get all() { return [...this.pool]; }
+
+  add(proxyStr) {
+    if (!proxyStr || typeof proxyStr !== 'string') return false;
+    const p = proxyStr.trim();
+    if (p && p.includes(':') && !this.pool.includes(p)) {
+      this.pool.push(p);
+      this.saveToDisk();
+      return true;
+    }
+    return false;
+  }
+
+  addMany(proxies) {
+    let count = 0;
+    for (const p of proxies) { if (this.add(p)) count++; }
+    if (count > 0) this.saveToDisk();
+    return count;
+  }
+
+  remove(proxyStr) {
+    const idx = this.pool.indexOf(proxyStr);
+    if (idx >= 0) { this.pool.splice(idx, 1); this.saveToDisk(); return true; }
+    return false;
+  }
+
+  getNext() {
+    if (this.pool.length === 0) return null;
+    const proxy = this.pool[this.index % this.pool.length];
+    this.index = (this.index + 1) % this.pool.length;
+    return proxy;
+  }
+
+  getMultiple(count) {
+    const result = [];
+    for (let i = 0; i < count; i++) {
+      const p = this.getNext();
+      if (p) result.push(p);
+    }
+    return result;
+  }
+
+  // Test and remove dead proxies from pool
+  async cleanDead() {
+    if (this.pool.length === 0) return;
+    const before = this.pool.length;
+    const results = await Promise.allSettled(this.pool.map(p => fastTestProxy(p)));
+    const alive = [];
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === 'fulfilled' && results[i].value.ok) {
+        alive.push(this.pool[i]);
+      }
+    }
+    if (alive.length < before) {
+      this.pool = alive;
+      this.saveToDisk();
+      console.log(`[ProxyBank] Clean: ${before}→${alive.length} (removed ${before - alive.length} dead)`);
+    }
+  }
+
+  // Scrape and add new proxies to pool
+  async fill() {
+    if (this._filling) return;
+    this._filling = true;
+    try {
+      const stats = await harvester.harvestAndVerify();
+      if (stats.alive > 0) console.log(`[ProxyBank] Fill: +${stats.alive} live proxies (pool: ${this.pool.length})`);
+      else console.log(`[ProxyBank] Fill: no live proxies found`);
+    } catch (err) {
+      console.log(`[ProxyBank] Fill error: ${err.message}`);
+    }
+    this._filling = false;
+  }
+
+  status() {
+    return {
+      poolSize: this.pool.length,
+      currentIndex: this.index,
+      proxies: this.pool.slice(0, 10),
     };
-    const request = isHttps
-      ? https.request({ host: url.hostname, port: targetPort, path: url.pathname + url.search, method: 'GET', headers, createConnection: () => tunnelSocket, rejectUnauthorized: true })
-      : http.request({ host: url.hostname, port: targetPort, path: url.pathname + url.search, method: 'GET', headers, createConnection: () => tunnelSocket });
-
-    let body = [];
-    request.on('response', (res) => {
-      res.on('data', (chunk) => body.push(chunk));
-      res.on('end', () => {
-        const fullBody = Buffer.concat(body);
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: fullBody,
-          contentType: res.headers['content-type'] || '',
-        });
-      });
-    });
-
-    request.on('error', (err) => {
-      tunnelSocket.destroy();
-      reject(err);
-    });
-
-    request.end();
-  });
+  }
 }
+
+const proxyBank = new ProxyBank();
+const harvester = new ProxyHarvester(proxyBank);
+
+
+
+
 
 // ── Generate per-tab fingerprint + behavior injection script ──
 function generateFingerprintScript() {
@@ -203,6 +200,11 @@ function generateFingerprintScript() {
 "try{Object.defineProperty(screen,'height',{get:function(){return " + sh + ";}})}catch(e){}" +
 "try{Object.defineProperty(screen,'colorDepth',{get:function(){return " + cd + ";}})}catch(e){}" +
 "try{Object.defineProperty(screen,'pixelDepth',{get:function(){return " + cd + ";}})}catch(e){}" +
+'try{delete window.RTCPeerConnection}catch(e){}' +
+'try{delete window.webkitRTCPeerConnection}catch(e){}' +
+'try{delete window.RTCDataChannel}catch(e){}' +
+"try{navigator.mediaDevices=undefined}catch(e){}" +
+"try{navigator.getBattery=undefined}catch(e){}" +
 'var _g=CanvasRenderingContext2D.prototype.getImageData;CanvasRenderingContext2D.prototype.getImageData=function(){var d=_g.apply(this,arguments);for(var i=0;i<d.data.length;i+=4){if(Math.random()>.9995){d.data[i]=(d.data[i]+1)%256;d.data[i+1]=(d.data[i+1]+2)%256;d.data[i+2]=(d.data[i+2]-1)%256;}}return d;};' +
 "var _gp=WebGLRenderingContext.prototype.getParameter;WebGLRenderingContext.prototype.getParameter=function(p){if(p===37445)return " + vendorStr + ";if(p===37446)return " + rendererStr + ";return _gp.apply(this,arguments);};" +
 "Date.prototype.getTimezoneOffset=function(){return " + tz + ";};" +
@@ -222,6 +224,37 @@ function generateFingerprintScript() {
 '})();' +
 '</script>';
   return scr;
+}
+
+// ── Extract main content only (no sidebar, ads, etc.) ──
+function extractMainContent(html, baseUrl) {
+  let main = html;
+  const removals = [
+    /<header[^>]*>[\s\S]*?<\/header>/gi,
+    /<footer[^>]*>[\s\S]*?<\/footer>/gi,
+    /<nav[^>]*>[\s\S]*?<\/nav>/gi,
+    /<aside[^>]*>[\s\S]*?<\/aside>/gi,
+    /<div[^>]*?(?:class|id)=["'][^"']*(?:sidebar|widget|advert|banner|promo|social|share|related|recommend|comment|footer|header|menu|nav|popup|overlay|modal|cookie|notification)[^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
+    /<div[^>]*?class=["'][^"']*ad[-_ ][^"']*["'][^>]*>[\s\S]*?<\/div>/gi,
+    /<iframe[^>]*>[\s\S]*?<\/iframe>/gi,
+    /<script[^>]*>[\s\S]*?<\/script>/gi,
+    /<style[^>]*>[\s\S]*?<\/style>/gi,
+    /<link[^>]*>/gi,
+    /<meta[^>]*>/gi,
+  ];
+  for (const re of removals) { main = main.replace(re, ''); }
+
+  // Try to find main content area
+  const contentMatch = main.match(/<(?:main|article)[^>]*>([\s\S]*?)<\/(?:main|article)>/i)
+    || main.match(/<div[^>]*?(?:class|id)=["'][^"']*(?:content|main|article|post|entry)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+
+  let body = contentMatch ? contentMatch[1] : main;
+
+  // Simplify: remove excess whitespace
+  body = body.replace(/\s+/g, ' ').trim();
+
+  // Wrap in minimal HTML
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><base href="${baseUrl}">${generateFingerprintScript()}<style>body{font-family:sans-serif;line-height:1.6;padding:16px;max-width:800px;margin:0 auto;color:#222;background:#fff}img,video{max-width:100%;height:auto}a{color:#1a73e8}*{margin:0 0 8px}</style></head><body>${body}</body></html>`;
 }
 
 // ── Rewrite HTML URLs to go through proxy ──
@@ -250,20 +283,9 @@ function rewriteHtml(html, baseUrl, proxyStr) {
     .replace(/<meta[^>]*?frame-ancestors[^>]*?>/gi, '');
 }
 
-// ── User-Agent rotation ──
-const UA_POOL = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-];
 
-function getRandomUA() {
-  return UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
-}
+
+
 
 // ── HTTP Server ──
 const server = http.createServer(async (req, res) => {
@@ -288,43 +310,171 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Proxy endpoint
+  // Proxy endpoint — auto-retry through bank on failure
   if (path === '/proxy') {
     const targetUrl = parsed.searchParams.get('url');
-    const proxyStr = parsed.searchParams.get('proxy') || '';
+    const contentOnly = parsed.searchParams.get('content-only') === 'true';
+    let proxyStr = parsed.searchParams.get('proxy') || '';
 
     if (!targetUrl) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing url parameter' }));
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Missing URL</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f5f5;color:#333}.card{background:#fff;border-radius:12px;padding:32px 40px;box-shadow:0 4px 24px rgba(0,0,0,.1);max-width:480px;text-align:center}h1{font-size:20px;color:#d32f2f;margin:0 0 8px}p{font-size:14px;color:#666}</style></head><body><div class="card"><h1>Missing URL</h1><p>No target URL was provided. Use: /proxy?url=TARGET_URL&proxy=IP:PORT</p></div></body></html>');
       return;
     }
 
-    const proxyInfo = proxyStr ? parseProxy(proxyStr) : null;
+    // Retry loop: try up to 5 proxies from bank
+    let tried = 0;
+    let lastErr = '';
+    while (tried < 5) {
+      let currentProxy = proxyStr || proxyBank.getNext();
+      if (!currentProxy) break;
 
-    try {
-      const result = await fetchThroughProxy(targetUrl, proxyInfo || { type: 'direct', host: '', port: 0, user: '', pass: '' });
-      const isHtml = result.contentType && result.contentType.includes('text/html');
+      const proxyInfo = parseProxy(currentProxy);
+      if (!proxyInfo) continue;
 
-      let body = result.body;
-      if (isHtml) {
-        body = Buffer.from(rewriteHtml(body.toString('utf-8'), targetUrl, proxyStr), 'utf-8');
-      }
+      try {
+        const result = await fetchThroughProxy(targetUrl, proxyInfo);
+        const isHtml = result.contentType && result.contentType.includes('text/html');
 
-      // Remove headers that block iframes
-      const responseHeaders = {};
-      const blocklist = ['x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'strict-transport-security', 'public-key-pins'];
-      for (const [key, value] of Object.entries(result.headers)) {
-        if (!blocklist.includes(key.toLowerCase())) {
-          responseHeaders[key] = value;
+        let body = result.body;
+        if (isHtml) {
+          const htmlStr = body.toString('utf-8');
+          if (contentOnly) {
+            body = Buffer.from(extractMainContent(htmlStr, targetUrl), 'utf-8');
+          } else {
+            body = Buffer.from(rewriteHtml(htmlStr, targetUrl, currentProxy), 'utf-8');
+          }
         }
-      }
-      // Pass through original headers unmodified — no synthetic headers added
 
-      res.writeHead(result.status, responseHeaders);
-      res.end(body);
+        const responseHeaders = {};
+        const blocklist = ['x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'strict-transport-security', 'public-key-pins'];
+        for (const [key, value] of Object.entries(result.headers)) {
+          if (!blocklist.includes(key.toLowerCase())) responseHeaders[key] = value;
+        }
+
+        res.writeHead(result.status, responseHeaders);
+        res.end(body);
+        return;
+      } catch (err) {
+        lastErr = err.message;
+        proxyBank.remove(currentProxy);
+        tried++;
+        if (!proxyStr) proxyStr = ''; // use bank on next retry
+      }
+    }
+
+    const errMsg = lastErr.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+    res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Proxy Error</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f5f5;color:#333}.card{background:#fff;border-radius:12px;padding:32px 40px;box-shadow:0 4px 24px rgba(0,0,0,.1);max-width:480px;text-align:center}h1{font-size:20px;margin:0 0 8px;color:#d32f2f}p{font-size:14px;color:#666;margin:0 0 4px;line-height:1.5}.hint{font-size:12px;color:#999;margin-top:12px}</style></head><body><div class="card"><h1>⚠️ Proxy Error</h1><p>${errMsg}</p><p class="hint">Tried 5 proxies — all dead. Pool size: ${proxyBank.size}</p></div></body></html>`);
+    return;
+  }
+
+  // ── Proxy Bank endpoints ──
+  if (path === '/proxy-bank/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(proxyBank.status()));
+    return;
+  }
+
+  if (path === '/proxy-bank/next') {
+    const proxy = proxyBank.getNext();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: !!proxy, proxy }));
+    return;
+  }
+
+  if (path === '/proxy-bank/pool') {
+    const n = parseInt(parsed.searchParams.get('n') || '5', 10);
+    const proxies = proxyBank.getMultiple(n);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, count: proxies.length, proxies }));
+    return;
+  }
+
+  if (path === '/proxy-bank/refresh') {
+    await proxyBank.fill();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, poolSize: proxyBank.size }));
+    return;
+  }
+
+  if (path === '/proxy-bank/fill') {
+    if (proxyBank._filling) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, message: 'Already filling', poolSize: proxyBank.size }));
+      return;
+    }
+    proxyBank.fill();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, message: 'Fill started in background', poolSize: proxyBank.size }));
+    return;
+  }
+
+  // ── Proxy Engine endpoints ──
+  if (path === '/proxy-engine/harvest') {
+    const stats = await harvester.harvestAndVerify();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ...stats }));
+    return;
+  }
+
+  if (path === '/proxy-engine/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ...harvester.getStatus() }));
+    return;
+  }
+
+  if (path === '/proxy-engine/clear-seen') {
+    harvester.seen.clear();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, seenCount: 0 }));
+    return;
+  }
+
+  // ── Proxy Bank: upload list ──
+  if (path === '/proxy-bank/upload' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', () => {
+      const lines = body.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#') && !l.startsWith('//'));
+      let added = 0;
+      for (const line of lines) {
+        const parsed = parseProxy(line);
+        if (parsed && proxyBank.add(parsed.label)) added++;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: true, added, total: lines.length, poolSize: proxyBank.size }));
+    });
+    return;
+  }
+
+  if (path === '/proxy-bank/add') {
+    const p = parsed.searchParams.get('proxy') || '';
+    const added = proxyBank.add(p);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, added, poolSize: proxyBank.size }));
+    return;
+  }
+
+  // ── IP Leak Check ──
+  if (path === '/check-ip') {
+    try {
+      const [directRes, proxyRes] = await Promise.allSettled([
+        fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) }),
+        fetchThroughProxy('https://api.ipify.org?format=json', { type: 'direct', host: '', port: 0, user: '', pass: '' }).then(r => JSON.parse(r.body.toString())).catch(() => null),
+      ]);
+      const directIp = directRes.status === 'fulfilled' ? (await directRes.value.json()).ip : 'unknown';
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        ok: true,
+        realIp: directIp,
+        note: 'Proxy bank may or may not change your visible IP depending on proxy type',
+        proxyBankActive: proxyBank.size > 0,
+        poolSize: proxyBank.size,
+      }));
     } catch (err) {
-      res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ error: err.message }));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
     }
     return;
   }
@@ -347,7 +497,7 @@ const server = http.createServer(async (req, res) => {
 
     const start = Date.now();
     try {
-      const result = await fetchThroughProxy('https://api.ipify.org?format=json', proxyInfo);
+      const result = await fetchThroughProxy('https://api.ipify.org?format=json', proxyInfo, 5000);
       const data = JSON.parse(result.body.toString());
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({
@@ -369,7 +519,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Scrape free proxies
+  // Scrape free proxies — returns ONLY live/verified proxies
   if (path === '/scrape-proxies') {
     const sources = [
       'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all',
@@ -378,23 +528,57 @@ const server = http.createServer(async (req, res) => {
       'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt',
       'https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt',
       'https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt',
+      'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
+      'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt',
+      'https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS.txt',
+      'https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5.txt',
+      'https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt',
+      'https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt',
+      'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt',
+      'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt',
+      'https://www.proxy-list.download/api/v1/get?type=http',
+      'https://www.proxy-list.download/api/v1/get?type=socks5',
     ];
 
     try {
       const allProxies = new Set();
       const results = await Promise.allSettled(sources.map(async (src) => {
-        const resp = await fetch(src, { signal: AbortSignal.timeout(10000) });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const text = await resp.text();
-        for (const line of text.split('\n')) {
-          const p = parseProxy(line.trim());
-          if (p) allProxies.add(`${p.host}:${p.port}`);
-        }
+        try {
+          const resp = await fetch(src, { signal: AbortSignal.timeout(5000) });
+          if (!resp.ok) return;
+          const text = await resp.text();
+          for (const line of text.split('\n')) {
+            const p = parseProxy(line.trim());
+            if (p) allProxies.add(`${p.host}:${p.port}`);
+          }
+        } catch (e) { console.error(`[Scrape] Source failed: ${src} — ${e.message}`); }
       }));
 
-      const proxyList = Array.from(allProxies);
+      const rawList = Array.from(allProxies);
+      const batchSize = parseInt(parsed.searchParams.get('batch') || '100', 10);
+      const skipTest = parsed.searchParams.get('verify') === 'false';
+      const limit = parseInt(parsed.searchParams.get('limit') || '0', 10) || rawList.length;
+
+      if (skipTest || rawList.length === 0) {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ ok: true, count: rawList.length, proxies: rawList, tested: false }));
+        return;
+      }
+
+      const toTest = rawList.slice(0, Math.min(limit, rawList.length));
+      const alive = await fastTestBatch(toTest, batchSize);
+      const deadCount = toTest.length - alive.length;
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ ok: true, count: proxyList.length, proxies: proxyList }));
+      res.end(JSON.stringify({
+        ok: true,
+        count: alive.length,
+        total: rawList.length,
+        testedCount: toTest.length,
+        alive: alive.length,
+        dead: deadCount,
+        proxies: alive,
+        tested: true,
+      }));
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -408,9 +592,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[PhantomView Proxy] Server running on http://localhost:${PORT}`);
-  console.log(`[PhantomView Proxy] Use: http://localhost:${PORT}/proxy?url=TARGET_URL&proxy=IP:PORT:USER:PASS`);
-  console.log(`[PhantomView Proxy] Proxy formats: IP:PORT, IP:PORT:USER:PASS, socks5://IP:PORT`);
+  console.log(`[PhantomView Proxy v3] Server running on http://localhost:${PORT}`);
+  console.log(`[PhantomView Proxy] Use: /proxy?url=TARGET&proxy=IP:PORT`);
+  console.log(`[PhantomView Proxy] Content-only: /proxy?url=TARGET&content-only=true`);
+  console.log(`[PhantomView Proxy] Proxy Bank: /proxy-bank/status`);
+  console.log(`[PhantomView Proxy] IP Check: /check-ip`);
+  console.log(`[PhantomView Proxy] Data: ${PROXY_DATA_FILE}`);
+  proxyBank.start();
 });
 
 server.on('error', (err) => {
