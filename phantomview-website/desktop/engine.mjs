@@ -54,7 +54,7 @@ export class FarmEngine {
     this.currentIndex = 0;
     this.proxies = [];
     this.url = '';
-    this.stats = { viewsSent: 0, cycles: 0, startedAt: null, activeView: false, signInWallsSkipped: 0 };
+    this.stats = { viewsSent: 0, cycles: 0, startedAt: null, activeView: false, issuesSkipped: { signin: 0, signup: 0, geoBlock: 0, ageGate: 0, paywall: 0, captcha: 0, empty: 0 } };
     this._onEvent = null;
     this._profilePrefix = path.join(os.tmpdir(), 'phantomview-session');
     this.headless = true;
@@ -80,7 +80,7 @@ export class FarmEngine {
 
   getScreenshots() {
     return this._browserPool
-      .filter(e => e.screenshot)
+      .filter(e => e.screenshot && e.page && !e.page.isClosed())
       .map(e => ({
         id: e.proxyLabel || 'direct',
         proxy: e.proxyLabel || 'direct',
@@ -189,7 +189,7 @@ export class FarmEngine {
     this.paused = false;
     this.url = targetUrl;
     this.currentIndex = 0;
-    this.stats = { viewsSent: 0, cycles: 0, startedAt: Date.now(), activeView: false, signInWallsSkipped: 0 };
+    this.stats = { viewsSent: 0, cycles: 0, startedAt: Date.now(), activeView: false, issuesSkipped: { signin: 0, signup: 0, geoBlock: 0, ageGate: 0, paywall: 0, captcha: 0, empty: 0 } };
 
     this._emit('start', { browser: browserInfo.type });
 
@@ -254,6 +254,10 @@ export class FarmEngine {
           this._emit('error', { proxy: proxy?.label || 'unknown', error: String(err) });
         }
         this.stats.cycles++;
+        // Check for global failure every 50 cycles
+        if (this.stats.cycles % 50 === 0 && this._bankUrl) {
+          this._detectGlobalFailure().catch(() => {});
+        }
       }
     };
 
@@ -499,68 +503,90 @@ export class FarmEngine {
     } catch (e) { console.error(`[FarmEngine] Close overlays evaluate error: ${e.message}`); }
   }
 
-  async _detectSignInWall(page) {
+  async _detectPageIssues(page) {
     try {
       const currentUrl = page.url() || '';
       const urlLower = decodeURIComponent(currentUrl).toLowerCase();
-      const urlPatterns = ['/login', '/signin', '/auth', '/register', '/signup', '/log-in', '/logon', '/authenticate'];
-      if (urlPatterns.some(p => urlLower.includes(p))) return true;
+      const urlAuth = ['/login', '/signin', '/auth', '/register', '/signup', '/log-in', '/logon', '/authenticate'];
+      const urlGeo = ['/blocked', '/unavailable', '/restricted', '/geo'];
+      const urlPay = ['/subscribe', '/pricing', '/premium', '/paywall'];
+      if (urlAuth.some(p => urlLower.includes(p))) return 'signin';
+      if (urlGeo.some(p => urlLower.includes(p))) return 'geoBlock';
+      if (urlPay.some(p => urlLower.includes(p))) return 'paywall';
 
       return await page.evaluate(() => {
         const title = (document.title || '').toLowerCase();
-        if (['sign in', 'log in', 'login', 'signin', 'create account', 'sign up', 'register'].some(k => title.includes(k))) return true;
+        const body = (document.body?.textContent || '').toLowerCase();
+        const bodyLen = body.trim().length;
 
-        const bodyText = (document.body?.textContent || '').toLowerCase();
-        const keywords = ['sign in', 'log in', 'create account', 'sign up', 'welcome back', 'register', 'continue with', 'forgot password'];
-        const matchCount = keywords.filter(k => bodyText.includes(k)).length;
+        // EMPTY PAGE — body has almost no content
+        if (bodyLen < 50 && !document.querySelector('img, video, iframe')) return 'empty';
+
+        // Common keywords — reused across checks
+        const signInKw = ['sign in', 'log in', 'signin', 'login', 'create account', 'sign up', 'register', 'continue with', 'welcome back', 'forgot password'];
+        const geoKw = ['not available in your country', 'not available in your region', 'this content is not available', 'geo-restricted', 'access denied', 'blocked in your country'];
+        const ageKw = ['confirm your age', 'you must be 18', 'age verification', 'date of birth', 'enter your birth date', 'are you 18'];
+        const payKw = ['subscribe to read', 'subscribe to continue', 'you\'ve reached your limit', 'premium content', 'upgrade to pro', 'subscribe to access', 'ad blocker detected'];
+
+        const hasSignIn = signInKw.some(k => body.includes(k));
+        const hasGeo = geoKw.some(k => body.includes(k));
+        const hasAge = ageKw.some(k => body.includes(k));
+        const hasPay = payKw.some(k => body.includes(k));
 
         const pwFields = document.querySelectorAll('input[type="password"]');
         const emailFields = document.querySelectorAll('input[type="email"], input[name="email"], input[name="username"], input[name="login"]');
         const hasFormField = pwFields.length > 0 || emailFields.length > 0;
 
-        // Strong signal: form field + sign-in keyword
-        if (hasFormField && matchCount >= 1) return true;
+        // SIGNIN: form field + keyword
+        if (hasFormField && hasSignIn) return 'signin';
+        // SIGNUP: register/signup form
+        if (hasFormField && (body.includes('create account') || body.includes('sign up'))) return 'signup';
 
-        // Check visible auth containers (class, id, form action)
-        const authSelectors = [
-          '[class*="auth-wall"]', '[class*="auth-container"]',
-          '[class*="signin"]', '[class*="sign-in"]',
-          '[class*="signup"]', '[class*="sign-up"]', '[class*="register"]',
-          '[class*="login"]', '[class*="log-in"]', '[class*="logon"]',
-          '[id*="login"]', '[id*="signin"]', '[id*="sign-in"]',
-          '.auth-form', '#signin-form', '#signup-form', '#login-form',
+        // GEO-BLOCK: geo keywords (no form field needed)
+        if (hasGeo) return 'geoBlock';
+
+        // AGE GATE: birth date form
+        const birthFields = document.querySelectorAll('input[type="date"], input[name*="birth"], input[name*="age"], select[name*="birth"], select[name*="age"]');
+        if ((birthFields.length > 0 || hasAge) && hasFormField) return 'ageGate';
+
+        // PAYWALL: pay keywords
+        if (hasPay) return 'paywall';
+
+        // CAPTCHA: captcha iframe or widget
+        const captchaFrames = document.querySelectorAll('iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], [class*="captcha"], [id*="captcha"]');
+        if (captchaFrames.length > 0) return 'captcha';
+
+        // Check visible auth containers
+        const authContainers = [
+          '[class*="auth-wall"]', '[class*="auth-container"]', '[class*="signin"]',
+          '[class*="sign-in"]', '[class*="login"]', '[class*="log-in"]', '[id*="login"]',
           'form[action*="login"]', 'form[action*="signin"]', 'form[action*="auth"]',
-          'form[action*="register"]', 'form[action*="signup"]',
-          '[data-testid*="login"]', '[data-testid*="Login"]',
-          '[data-testid*="signin"]', '[data-testid*="Signin"]',
-          '[data-testid*="auth"]', '[data-testid*="Auth"]',
-          '[data-testid*="signup"]', '[data-testid*="Signup"]',
         ];
-        for (const sel of authSelectors) {
+        for (const sel of authContainers) {
           try {
             const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null) return true;
+            if (el && el.offsetParent !== null) return 'signin';
           } catch(e) {}
         }
 
-        // Check role="dialog" / modal with sign-in text
+        // role="dialog" modals with form
         const dialogs = document.querySelectorAll('div[role="dialog"], [role="presentation"], .modal, [class*="modal"], [class*="overlay"]');
         for (const el of dialogs) {
           try {
             if (el.offsetParent === null) continue;
             const text = (el.textContent || '').toLowerCase();
-            if (keywords.some(k => text.includes(k)) && hasFormField) return true;
+            if (hasFormField && (signInKw.some(k => text.includes(k)))) return 'signin';
           } catch(e) {}
         }
 
-        // Check prominent headings/buttons for sign-in text
-        const headings = document.querySelectorAll('h1, h2, h3, button[type="submit"], [class*="heading"], [class*="title"]');
+        // Headings/buttons with auth text
+        const headings = document.querySelectorAll('h1, h2, h3, button[type="submit"], [class*="heading"]');
         for (const el of headings) {
           const text = (el.textContent || '').toLowerCase().trim();
-          if (['sign in', 'log in', 'sign up', 'sign up now', 'create account', 'register', 'get started', 'continue with'].includes(text)) return true;
+          if (['sign in', 'log in', 'sign up', 'create account', 'register'].includes(text)) return 'signin';
         }
 
-        // Check for full-page overlay with form (position fixed + high z-index)
+        // Full-page overlay with form
         const allDivs = document.querySelectorAll('div');
         const maxCheck = Math.min(allDivs.length, 200);
         for (let i = 0; i < maxCheck; i++) {
@@ -569,16 +595,61 @@ export class FarmEngine {
             const cs = window.getComputedStyle(el);
             if (cs.position === 'fixed' && parseInt(cs.zIndex) > 100 && el.offsetParent !== null) {
               const text = (el.textContent || '').toLowerCase();
-              if (keywords.some(k => text.includes(k)) && el.querySelector('input')) return true;
+              if (el.querySelector('input') && (signInKw.some(k => text.includes(k)))) return 'signin';
             }
           } catch(e) {}
         }
 
-        return false;
+        return null;
       });
     } catch(e) {
+      return null;
+    }
+  }
+
+  async _tryDismissIssues(page, issueType) {
+    if (issueType === 'captcha' || issueType === 'empty' || issueType === 'geoBlock' || issueType === 'paywall') {
       return false;
     }
+    await this._closeOverlays(page);
+    try {
+      await page.evaluate(() => {
+        document.querySelectorAll('div[role="dialog"], [class*="modal"], [class*="overlay"]').forEach(el => {
+          if (el.offsetParent === null) return;
+          const btn = el.querySelector('button[aria-label*="Close"], button[aria-label*="close"], [class*="close"], [data-dismiss]');
+          if (btn) { btn.click(); return; }
+          el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        });
+      });
+    } catch(e) { console.error(`[FarmEngine] Dismiss error: ${e.message}`); }
+  }
+
+  async _recycleView(poolEntry, proxy) {
+    try { await poolEntry.page.close(); } catch(e) {}
+    const newPage = await poolEntry.browser.newPage();
+    await this._setupPageDefaults(newPage, proxy);
+    poolEntry.page = newPage;
+    poolEntry.viewsDone++;
+    this.stats.activeView = false;
+  }
+
+  async _detectGlobalFailure() {
+    const totalSkipped = Object.values(this.stats.issuesSkipped || {}).reduce((s, v) => s + v, 0);
+    const totalViews = totalSkipped + this.stats.viewsSent;
+    if (totalViews < 10) return false;
+    const failRate = totalSkipped / totalViews;
+    if (failRate > 0.7 && this.proxies.length > 0) {
+      console.log(`[FarmEngine] Global failure ${Math.round(failRate * 100)}% — triggering new proxy harvest`);
+      try {
+        const r = await fetch(`${this._bankUrl}/proxy-engine/harvest`, { signal: AbortSignal.timeout(300000) });
+        const d = await r.json();
+        console.log(`[FarmEngine] Re-harvest complete: ${d.alive || 0} live proxies`);
+      } catch (e) {
+        console.error(`[FarmEngine] Re-harvest failed: ${e.message}`);
+      }
+      return true;
+    }
+    return false;
   }
 
   async _launchView(url, proxy, execPath) {
@@ -610,22 +681,17 @@ export class FarmEngine {
         poolEntry.screenshotAt = Date.now();
       } catch (e) { console.error(`[FarmEngine] Screenshot error: ${e.message}`); poolEntry.screenshot = null; }
 
-      // Sign-in wall detection — try to dismiss first, else close page & reuse same IP
-      const hasSignIn = await this._detectSignInWall(poolEntry.page);
-      if (hasSignIn) {
-        console.log(`[FarmEngine] Sign-in wall detected for ${poolEntry.proxyLabel}, attempting dismiss...`);
-        await this._closeOverlays(poolEntry.page);
+      // Smart Tab Handler — Detect all issue types
+      const issueType = await this._detectPageIssues(poolEntry.page);
+      if (issueType) {
+        console.log(`[FarmEngine] ${issueType} detected for ${poolEntry.proxyLabel}, attempting dismiss...`);
+        await this._tryDismissIssues(poolEntry.page, issueType);
         await delay(2000);
 
-        if (await this._detectSignInWall(poolEntry.page)) {
-          console.log(`[FarmEngine] Sign-in wall persists for ${poolEntry.proxyLabel}, closing page and reusing same IP...`);
-          this.stats.signInWallsSkipped++;
-          try { await poolEntry.page.close(); } catch(e) {}
-          const newPage = await poolEntry.browser.newPage();
-          await this._setupPageDefaults(newPage, proxy);
-          poolEntry.page = newPage;
-          poolEntry.viewsDone++;
-          this.stats.activeView = false;
+        if (await this._detectPageIssues(poolEntry.page)) {
+          console.log(`[FarmEngine] ${issueType} persists for ${poolEntry.proxyLabel}, recycling page...`);
+          this.stats.issuesSkipped[issueType] = (this.stats.issuesSkipped[issueType] || 0) + 1;
+          await this._recycleView(poolEntry, proxy);
           return;
         }
       }
@@ -633,6 +699,7 @@ export class FarmEngine {
       const watchTime = getViewDuration(this.fastMode, url);
       const startTime = Date.now();
       let lastHealthCheck = 0;
+      let lastIssueCheck = 0;
       let failCount = 0;
 
       while (Date.now() - startTime < watchTime && this.running) {
@@ -649,6 +716,18 @@ export class FarmEngine {
           } else {
             failCount++;
             if (failCount >= 2) throw new Error('Proxy died during view');
+          }
+        }
+
+        // Periodic issue re-check every 10s (catches late-appearing walls)
+        if (Date.now() - lastIssueCheck > 10000) {
+          lastIssueCheck = Date.now();
+          const midIssue = await this._detectPageIssues(poolEntry.page);
+          if (midIssue) {
+            console.log(`[FarmEngine] ${midIssue} appeared mid-view for ${poolEntry.proxyLabel}, recycling...`);
+            this.stats.issuesSkipped[midIssue] = (this.stats.issuesSkipped[midIssue] || 0) + 1;
+            await this._recycleView(poolEntry, proxy);
+            return;
           }
         }
 

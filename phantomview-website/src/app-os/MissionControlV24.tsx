@@ -138,6 +138,16 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
     estimatedRamMb: number;
   }
 
+  interface FarmIssues {
+    signin: number;
+    signup: number;
+    geoBlock: number;
+    ageGate: number;
+    paywall: number;
+    captcha: number;
+    empty: number;
+  }
+
   interface FarmStatus {
     running: boolean;
     paused: boolean;
@@ -147,7 +157,7 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
     cycles: number;
     startedAt: number | null;
     activeView: boolean;
-    signInWallsSkipped?: number;
+    issuesSkipped?: FarmIssues;
     pool?: FarmPoolStatus;
   }
 
@@ -883,7 +893,7 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                 </span>
                 <span className="flex items-center gap-1 text-neutral-500">
                   <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
-                  <span className="font-semibold text-amber-600">{farmStatus.signInWallsSkipped || 0}</span> sign-in
+                  <span className="font-semibold text-amber-600">{Object.values(farmStatus.issuesSkipped || {}).reduce((a: number, b: number) => a + b, 0)}</span> blocked
                 </span>
                 <span className="flex items-center gap-1 text-neutral-500">
                   <Monitor className="w-3.5 h-3.5 text-emerald-500" />
@@ -1375,7 +1385,7 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                     <div className="card p-5 text-center">
                       <Globe className="w-8 h-8 text-blue-500 mx-auto mb-2" />
                       <div className="text-3xl font-bold text-blue-600">{farmStatus.proxyCount}</div>
-                      <div className="text-xs text-neutral-500">Proxies Collected</div>
+                      <div className="text-xs text-neutral-500">Proxies</div>
                     </div>
                     <div className="card p-5 text-center">
                       <Clock className="w-8 h-8 text-violet-500 mx-auto mb-2" />
@@ -1405,12 +1415,27 @@ export function MissionControlV24({ onBack }: MissionControlV24Props) {
                         </div>
                         <div>
                           <span className="block text-lg font-bold text-neutral-900 dark:text-white">{farmStatus.pool.headless ? 'Hidden' : 'Visible'}</span>
-                          <span className="text-neutral-500">Headless</span>
+                          <span className="text-neutral-500">Mode</span>
                         </div>
                         <div>
                           <span className="block text-lg font-bold text-neutral-900 dark:text-white">~{estimatedRam}MB</span>
                           <span className="text-neutral-500">RAM</span>
                         </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Blocked Pages Breakdown */}
+                  {farmStatus?.issuesSkipped && Object.values(farmStatus.issuesSkipped).some(v => v > 0) && (
+                    <div className="card p-4">
+                      <h4 className="text-xs font-semibold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-2">Blocked Pages</h4>
+                      <div className="grid grid-cols-4 gap-2 text-center text-[10px]">
+                        {Object.entries(farmStatus.issuesSkipped).map(([key, val]) => (
+                          <div key={key} className="p-2 rounded-lg bg-neutral-50 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800">
+                            <div className="text-sm font-bold text-neutral-900 dark:text-white">{val as number}</div>
+                            <div className="text-neutral-500 truncate">{key}</div>
+                          </div>
+                        ))}
                       </div>
                     </div>
                   )}
